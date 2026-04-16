@@ -18,10 +18,12 @@ def plot_epochs(epochs: mne.EpochsArray,
     Optionally contrast epochs by conditions specified in condition_queries.
     """
 
-    if condition_queries is not None:
-        assert epochs.metadata is not None, "Epochs must have metadata to use condition queries."
+    if condition_queries is None:
+        # Use a string key so groupby('condition') picks it up — it drops NaN keys.
+        condition_queries = {"all": None}
     else:
-        condition_queries = {None: None}
+        assert epochs.metadata is not None, "Epochs must have metadata to use condition queries."
+
     epoch_data = epochs.get_data()  # shape: (n_epochs, n_channels, n_times)
 
     smax = None
@@ -48,8 +50,6 @@ def plot_epochs(epochs: mne.EpochsArray,
         all_epochs.reset_index(),
         how="cross"
     )
-    
-    ####
 
     facet_kwargs = {
         **dict(col_wrap=2, sharey=False, height=3),
@@ -58,12 +58,16 @@ def plot_epochs(epochs: mne.EpochsArray,
 
     g = sns.FacetGrid(plot_df, col="channel_idx", **facet_kwargs)
 
-    def plot_facet(data, color, **kwargs):
+    palette = sns.color_palette(n_colors=len(condition_queries))
+    condition_colors = dict(zip(condition_queries.keys(), palette))
+    show_legend = len(condition_queries) > 1
+
+    def plot_facet(data, **kwargs):
         ax = plt.gca()
         channel_idx = data['channel_idx'].iloc[0]
 
-        for condition, condition_data in data.groupby('condition'):
-            epoch_indices = condition_data['epoch_idx'].values
+        for condition, cond_df in data.groupby('condition'):
+            epoch_indices = cond_df['epoch_idx'].values
 
             times = epochs.times
             data_ij = epoch_data[epoch_indices, channel_idx]
@@ -74,12 +78,16 @@ def plot_epochs(epochs: mne.EpochsArray,
             data_ij_mean = np.nanmean(data_ij, axis=0)
             data_ij_sem = np.nanstd(data_ij, axis=0) / np.sqrt(len(epoch_indices))
 
-            ax.plot(times, data_ij_mean, label=str(condition) if condition is not None else "all", **kwargs)
+            color = condition_colors[condition]
+            ax.plot(times, data_ij_mean, color=color, label=str(condition))
             ax.fill_between(times,
                             data_ij_mean - data_ij_sem,
                             data_ij_mean + data_ij_sem,
-                            alpha=0.3)
-            
+                            color=color, alpha=0.3)
+
+        if show_legend:
+            ax.legend(fontsize=8)
+
     g.map_dataframe(plot_facet)
 
     return g
