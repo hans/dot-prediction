@@ -3,3 +3,6 @@
 *.csv
 *.swp
 *.pyc
+
+data/
+old/
