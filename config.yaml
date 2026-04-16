@@ -1,0 +1,31 @@
+# External roots (override per-machine with `snakemake --config key=value`
+# or a second --configfile).
+neuralynx_raw_root: /data_store1/human/Neuralynx
+neuralynx_preproc_root: /data_store1/human/Neuralynx_preproc
+
+# Epoching parameters (in samples at final_hz).
+final_hz: 100
+buffer_before: 300
+buffer_after: 150
+frequency_bands: [theta, hga]
+
+subjects:
+  EC347:
+    block: B16
+    task: dot-prediction
+    # Null = auto-detect the single subdirectory under the block root.
+    session_subdir: null
+    # BNC channels (1-indexed, matching the Neuralynx convention).
+    mic_channel: 2
+    photodiode_channel: 3
+    speaker_channel: null
+    # Suffixes for .ncs / Events_*.nev files.
+    ncs_suffix: ""
+    event_suffix: ""
+    # Window in the raw recording containing the task.
+    expt_start_time: 30
+    expt_end_time: 1289
+    photodiode_detector:
+      smooth_env_s: 0.01
+      min_sep_s: 0.1
+      prom_z: 3.5

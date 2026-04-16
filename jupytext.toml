@@ -1,0 +1,6 @@
+# The .py in percent format is the canonical diffable source.
+# ploomber_engine converts it to .ipynb on the fly when Snakemake runs it.
+formats = "ipynb,py:percent"
+notebook_metadata_filter = "-all"
+# Preserve cell tags so the parameters-cell tag survives a jupytext roundtrip.
+cell_metadata_filter = "tags"

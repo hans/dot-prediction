@@ -1,0 +1,7 @@
+# Copy to config.local.yaml (gitignored) and edit for your machine.
+# Keys here override the matching keys in config.yaml.
+
+# Where the raw Neuralynx recordings and the preprocessed Hilbert output live
+# on this machine. Leave any key out to inherit the default from config.yaml.
+neuralynx_raw_root: /path/to/your/Neuralynx
+neuralynx_preproc_root: /path/to/your/Neuralynx_preproc

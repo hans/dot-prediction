@@ -1,0 +1,3 @@
+[submodule "vendor/EMU_data_collection"]
+	path = vendor/EMU_data_collection
+	url = https://github.com/ChangLabUcsf/EMU_data_collection
