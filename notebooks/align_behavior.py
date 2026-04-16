@@ -20,6 +20,7 @@
 
 # %% tags=["parameters"]
 behavior_path = "data/EC347/behavior/data.csv"
+model_outputs_path = "data/EC347/model_outputs/model_outputs.csv"
 edges_path = "results/EC347/photodiode_edges.parquet"
 trials_out = "results/EC347/trials.parquet"
 
@@ -188,6 +189,42 @@ trials["l2_error_previous_bin"] = trials.groupby("trial_idx")["l2_error_bin"].sh
 f, ax = plt.subplots(figsize=(6, 3))
 ax.hist(trials.l2_error.dropna(), bins=40)
 ax.set_xlabel("L2 error (px)")
+ax.set_ylabel("count")
+
+# %% [markdown]
+# ## LoT marginalized prediction error
+# Merge the posterior-weighted expected PE from the LoT particle model onto
+# each subtrial so downstream analyses can contrast neural activity by the
+# model's *expected* surprise at reveal. Model-outputs rows are at
+# ``(seq_id, tpt, model, model_particle)`` grain; `model_marg_*` is constant
+# within a `(seq_id, tpt, model)` group so we take the first row.
+
+# %%
+model_outputs = pd.read_csv(model_outputs_path)
+lot = model_outputs[model_outputs.model == "LoT"]
+lot_marg = (
+    lot.groupby(["seq_id", "tpt", "seq_attempt"], as_index=False)[
+        ["model_marg_prediction_error", "model_marg_relative_prediction_error"]
+    ]
+    .first()
+)
+
+trials = trials.merge(lot_marg, on=["seq_id", "tpt", "seq_attempt"], how="left")
+
+# Tercile bin for the binary high/low contrast (parallels l2_error_bin with q=5).
+trials["model_marg_prediction_error_bin"] = pd.qcut(
+    trials["model_marg_prediction_error"], q=3, labels=False
+)
+
+# QC: every click subtrial (tpt>=3) should have a marg PE.
+missing = trials[(trials.tpt >= 3) & trials.model_marg_prediction_error.isna()]
+assert missing.empty, (
+    f"{len(missing)} subtrials with tpt>=3 are missing model_marg_prediction_error"
+)
+
+f, ax = plt.subplots(figsize=(6, 3))
+ax.hist(trials.model_marg_prediction_error.dropna(), bins=40)
+ax.set_xlabel("LoT marginalized PE")
 ax.set_ylabel("count")
 
 # %%
