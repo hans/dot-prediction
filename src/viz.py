@@ -9,7 +9,10 @@ import seaborn as sns
 def plot_epochs(epochs: mne.EpochsArray,
                 channel_indices: list[int] = None,
                 condition_queries: dict[str] = None,
-                smoke_test=False):
+                tmax=None,
+                smoke_test=False,
+                **facet_kwargs,
+                ) -> sns.FacetGrid:
     """
     Plot faceted epochs data, one electrode per facet.
     Optionally contrast epochs by conditions specified in condition_queries.
@@ -20,6 +23,11 @@ def plot_epochs(epochs: mne.EpochsArray,
     else:
         condition_queries = {None: None}
     epoch_data = epochs.get_data()  # shape: (n_epochs, n_channels, n_times)
+
+    smax = None
+    if tmax is not None:
+        assert tmax <= epochs.times[-1], "tmax exceeds the maximum time of the epochs."
+        smax = np.searchsorted(epochs.times, tmax)
 
     condition_data = {}
     for label, query in condition_queries.items():
@@ -32,7 +40,7 @@ def plot_epochs(epochs: mne.EpochsArray,
 
     # make a dummy df to generate facetgrid
     electrode_df = pd.DataFrame({
-        'channel_idx': channel_indices if channel_indices is not None else range(data.shape[1]),
+        'channel_idx': channel_indices if channel_indices is not None else list(range(epoch_data.shape[1])),
     })
     # plot_df is a cross product of electrode_df and condition_data
     plot_df = pd.merge(
@@ -43,7 +51,12 @@ def plot_epochs(epochs: mne.EpochsArray,
     
     ####
 
-    g = sns.FacetGrid(plot_df, col="channel_idx", col_wrap=2, sharey=False, height=3)
+    facet_kwargs = {
+        **dict(col_wrap=2, sharey=False, height=3),
+        **facet_kwargs
+    }
+
+    g = sns.FacetGrid(plot_df, col="channel_idx", **facet_kwargs)
 
     def plot_facet(data, color, **kwargs):
         ax = plt.gca()
@@ -51,11 +64,15 @@ def plot_epochs(epochs: mne.EpochsArray,
 
         for condition, condition_data in data.groupby('condition'):
             epoch_indices = condition_data['epoch_idx'].values
-            data_ij = epoch_data[epoch_indices, channel_idx]
 
-            data_ij_mean = np.mean(data_ij, axis=0)
-            data_ij_sem = np.std(data_ij, axis=0) / np.sqrt(len(epoch_indices))
             times = epochs.times
+            data_ij = epoch_data[epoch_indices, channel_idx]
+            if smax is not None:
+                times = times[:smax]
+                data_ij = data_ij[:, :smax]
+
+            data_ij_mean = np.nanmean(data_ij, axis=0)
+            data_ij_sem = np.nanstd(data_ij, axis=0) / np.sqrt(len(epoch_indices))
 
             ax.plot(times, data_ij_mean, label=str(condition) if condition is not None else "all", **kwargs)
             ax.fill_between(times,
