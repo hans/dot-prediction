@@ -17,6 +17,7 @@ dependencies = [
     "nibabel>=5.4.2",
     "numpy>=2.4.4",
     "pandas>=3.0.2",
+    "pandera>=0.21.0",
     "ploomber-engine>=0.0.33",
     "pyarrow>=23.0.1",
     "scikit-learn>=1.8.0",
