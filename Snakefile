@@ -103,14 +103,24 @@ rule detect_photodiode_edges:
     input:
         parquet=rules.extract_photodiode.output.parquet,
         meta=rules.extract_photodiode.output.meta,
+        notebook="notebooks/detect_photodiode_edges.py",
     output:
         edges="results/{subject}/photodiode_edges.parquet",
-    params:
-        expt_start_time=lambda wc: subj(wc)["expt_start_time"],
-        expt_end_time=lambda wc: subj(wc)["expt_end_time"],
-        detector=lambda wc: subj(wc)["photodiode_detector"],
-    script:
-        "scripts/detect_photodiode_edges.py"
+        notebook="results/{subject}/notebooks/detect_photodiode_edges.ipynb",
+    run:
+        s = subj(wildcards)
+        run_notebook(
+            input.notebook,
+            output.notebook,
+            parameters=dict(
+                photodiode_path=input.parquet,
+                meta_path=input.meta,
+                edges_out=output.edges,
+                expt_start_time=s["expt_start_time"],
+                expt_end_time=s["expt_end_time"],
+                detector=dict(s["photodiode_detector"]),
+            ),
+        )
 
 
 rule align_behavior:
