@@ -80,7 +80,12 @@ def ecog_hilbert_h5(wc):
 rule all:
     input:
         expand(
-            "results/{subject}/epochs/{band}-epo.fif",
+            "results/{subject}/notebooks/erps_{band}.ipynb",
+            subject=SUBJECTS,
+            band=BANDS,
+        ),
+        expand(
+            "results/{subject}/notebooks/patterns_{band}.ipynb",
             subject=SUBJECTS,
             band=BANDS,
         ),
@@ -156,3 +161,31 @@ rule epoch_ecog:
         buffer_after=config["buffer_after"],
     script:
         "scripts/epoch_ecog.py"
+
+
+rule erps:
+    input:
+        epochs="results/{subject}/epochs/{band}-epo.fif",
+        notebook="notebooks/erps.py",
+    output:
+        notebook="results/{subject}/notebooks/erps_{band}.ipynb",
+    run:
+        run_notebook(
+            input.notebook,
+            output.notebook,
+            parameters=dict(epochs_path=input.epochs),
+        )
+
+
+rule patterns:
+    input:
+        epochs="results/{subject}/epochs/{band}-epo.fif",
+        notebook="notebooks/patterns.py",
+    output:
+        notebook="results/{subject}/notebooks/patterns_{band}.ipynb",
+    run:
+        run_notebook(
+            input.notebook,
+            output.notebook,
+            parameters=dict(epochs_path=input.epochs),
+        )

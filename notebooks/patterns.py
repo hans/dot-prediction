@@ -18,8 +18,7 @@
 # Reads epochs produced by the `epoch_ecog` rule.
 
 # %% tags=["parameters"]
-subject = "EC347"
-band = "hga"
+epochs_path = "results/EC347/epochs/hga-epo.fif"
 
 # %%
 from typing import Optional
@@ -34,7 +33,7 @@ from sklearn.preprocessing import StandardScaler
 from tqdm.auto import tqdm
 
 # %%
-epochs = mne.read_epochs(f"results/{subject}/epochs/{band}-epo.fif", preload=True)
+epochs = mne.read_epochs(epochs_path, preload=True)
 epochs
 
 

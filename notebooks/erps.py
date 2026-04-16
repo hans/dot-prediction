@@ -19,9 +19,12 @@
 # `epochs.metadata.query(...)`. Edit and add new contrasts here freely.
 
 # %% tags=["parameters"]
-subject = "EC347"
-band = "hga"
+epochs_path = "results/EC347/epochs/hga-epo.fif"
 channel_indices = [40, 41, 66, 67, 69, 70]
+
+# %%
+import sys
+sys.path.append("src")
 
 # %%
 import mne
@@ -29,7 +32,7 @@ import mne
 from viz import plot_epochs
 
 # %%
-epochs = mne.read_epochs(f"results/{subject}/epochs/{band}-epo.fif", preload=True)
+epochs = mne.read_epochs(epochs_path, preload=True)
 epochs
 
 # %% [markdown]
