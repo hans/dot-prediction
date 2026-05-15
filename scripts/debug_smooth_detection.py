@@ -104,11 +104,12 @@ def main():
             for x, y in raw_c.astype(int):
                 cv2.circle(vis, (x, y), 5, (0, 0, 255), -1)
 
-        _draw_quad(vis, sm_c, (0, 255, 0), thickness=3, dashed=False)
-        for (x, y), label in zip(sm_c.astype(int), ["TL", "TR", "BR", "BL"]):
-            cv2.circle(vis, (x, y), 8, (0, 255, 0), -1)
-            cv2.putText(vis, label, (x + 10, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        if not np.any(np.isnan(sm_c)):
+            _draw_quad(vis, sm_c, (0, 255, 0), thickness=3, dashed=False)
+            for (x, y), label in zip(sm_c.astype(int), ["TL", "TR", "BR", "BL"]):
+                cv2.circle(vis, (x, y), 8, (0, 255, 0), -1)
+                cv2.putText(vis, label, (x + 10, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
         raw_tag = "ok" if raw_c is not None else "none"
         cv2.putText(vis, f"raw={raw_tag}  smoothed=ok", (30, 50),
