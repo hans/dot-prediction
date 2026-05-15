@@ -9,8 +9,11 @@ def _c(val):
 
 
 GOOD  = _c(500.0)
+GOOD.flags.writeable = False
 GOOD2 = _c(505.0)   # slight camera drift
+GOOD2.flags.writeable = False
 BAD   = _c(0.0)     # totally wrong (hand occlusion failure)
+BAD.flags.writeable = False
 
 
 # --- output contract ---
@@ -36,10 +39,10 @@ def test_all_none_raises():
 
 def test_interior_none_interpolated():
     """A single None in the middle is filled by linear interpolation."""
-    raw = [_c(100.0)] * 5 + [None] + [_c(100.0)] * 5
+    raw = [_c(100.0)] * 5 + [None] + [_c(200.0)] * 5
     out = smooth_corners(raw, window=1)   # window=1 disables smoothing
     assert not np.any(np.isnan(out))
-    np.testing.assert_allclose(out[5], 100.0, atol=1.0)
+    np.testing.assert_allclose(out[5], 150.0, atol=1.0)
 
 
 def test_leading_none_edge_filled():
@@ -94,4 +97,5 @@ def test_window_1_returns_interpolated_only():
     assert out.shape == (3, 4, 2)
     assert not np.any(np.isnan(out))
     np.testing.assert_allclose(out[0], 500.0, atol=1e-3)
+    np.testing.assert_allclose(out[1], 502.5, atol=1.0)
     np.testing.assert_allclose(out[2], 505.0, atol=1e-3)
