@@ -1,0 +1,45 @@
+from pathlib import Path
+
+configfile: "config_eyetrack.yaml"
+
+if Path("config_eyetrack.local.yaml").exists():
+    configfile: "config_eyetrack.local.yaml"
+
+SUBJECTS = list(config["subjects"].keys())
+
+
+def subj(wc):
+    return config["subjects"][wc.subject]
+
+
+rule all:
+    input:
+        expand("results/{subject}/eyetrack/screen_gaze_overlay.mp4", subject=SUBJECTS),
+
+
+rule render_screen_gaze:
+    input:
+        video=lambda wc: f"{subj(wc)['tobii_dir']}/{subj(wc)['scene_video']}",
+        tsv=lambda wc: f"{subj(wc)['tobii_dir']}/{subj(wc)['tobii_tsv']}",
+        script="scripts/render_screen_gaze.py",
+    output:
+        mp4="results/{subject}/eyetrack/screen_gaze_overlay.mp4",
+    params:
+        start=config["clip_start_s"],
+        duration=config["clip_duration_s"],
+    shell:
+        "uv run python {input.script} "
+        "--video {input.video} --tsv {input.tsv} "
+        "--start {params.start} --duration {params.duration} "
+        "--output {output.mp4}"
+
+
+# Future rules (not yet implemented):
+#
+# rule extract_gaze_fixations:
+#     Produce results/{subject}/eyetrack/gaze_fixations.parquet —
+#     per-frame screen-space gaze coordinates, for analysis notebooks.
+#
+# rule analyze_gaze_behavior:
+#     Run a notebook from notebooks/eyetrack/ relating fixation patterns
+#     to LoT model predictions.

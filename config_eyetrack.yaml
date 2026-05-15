@@ -1,0 +1,9 @@
+subjects:
+  EC347:
+    tobii_dir: /Users/jon/Projects/dot-prediction/data/EC347/tobii
+    scene_video: scenevideo.mp4
+    tobii_tsv: EC347_B16_tobii.tsv
+
+clip_start_s: 120.0
+clip_duration_s: 30.0
+smoothing_window: 10
