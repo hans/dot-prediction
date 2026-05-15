@@ -65,6 +65,7 @@ def detect_corners(frame: np.ndarray) -> np.ndarray | None:
     if not large:
         return None
     largest = max(large, key=cv2.contourArea)
+    largest = cv2.convexHull(largest)
 
     # Approximate to a polygon; require exactly 4 sides.
     # Try increasing epsilon until we get a 4-vertex result (handles motion blur
