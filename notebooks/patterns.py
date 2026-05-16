@@ -18,8 +18,7 @@
 # Reads epochs produced by the `epoch_ecog` rule.
 
 # %% tags=["parameters"]
-subject = "EC347"
-band = "hga"
+epochs_path = "results/EC347/epochs/hga-epo.fif"
 
 # %%
 from typing import Optional
@@ -34,7 +33,7 @@ from sklearn.preprocessing import StandardScaler
 from tqdm.auto import tqdm
 
 # %%
-epochs = mne.read_epochs(f"results/{subject}/epochs/{band}-epo.fif", preload=True)
+epochs = mne.read_epochs(epochs_path, preload=True)
 epochs
 
 
@@ -122,10 +121,10 @@ pca_channels = list(range(20, 41))
 pca_tmin, pca_tmax = 0.0, 0.5
 pca_dim = 10
 
-patterns = epochs.metadata.stimulus.unique()[:10]
-mask = epochs.metadata.stimulus.isin(patterns)
+patterns = epochs.metadata.seq_id.unique()[:10]
+mask = epochs.metadata.seq_id.isin(patterns)
 epoch_idxs = np.where(mask.values)[0]
-labels = epochs.metadata.loc[mask, "stimulus"].values
+labels = epochs.metadata.loc[mask, "seq_id"].values
 
 smin, smax = epochs.time_as_index([pca_tmin, pca_tmax])
 data = epochs.get_data()[epoch_idxs][:, pca_channels, smin:smax]

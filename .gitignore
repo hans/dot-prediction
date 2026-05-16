@@ -8,6 +8,7 @@ data/
 old/
 results/
 config.local.yaml
+config_eyetrack.local.yaml
 .snakemake
 
 # uv / python

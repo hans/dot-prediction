@@ -1,0 +1,6 @@
+# Copy to config_eyetrack.local.yaml (gitignored) and edit for your machine.
+# Keys here override the matching keys in config_eyetrack.yaml.
+
+subjects:
+  EC347:
+    tobii_dir: /path/to/EC347/tobii

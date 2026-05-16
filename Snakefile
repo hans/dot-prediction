@@ -80,7 +80,17 @@ def ecog_hilbert_h5(wc):
 rule all:
     input:
         expand(
-            "results/{subject}/epochs/{band}-epo.fif",
+            "results/{subject}/notebooks/erps_{band}.ipynb",
+            subject=SUBJECTS,
+            band=BANDS,
+        ),
+        expand(
+            "results/{subject}/notebooks/patterns_{band}.ipynb",
+            subject=SUBJECTS,
+            band=BANDS,
+        ),
+        expand(
+            "results/{subject}/notebooks/prediction_error_{band}.ipynb",
             subject=SUBJECTS,
             band=BANDS,
         ),
@@ -126,6 +136,7 @@ rule detect_photodiode_edges:
 rule align_behavior:
     input:
         behavior="data/{subject}/behavior/data.csv",
+        model_outputs="data/{subject}/model_outputs/model_outputs.csv",
         edges=rules.detect_photodiode_edges.output.edges,
         notebook="notebooks/align_behavior.py",
     output:
@@ -137,6 +148,7 @@ rule align_behavior:
             output.notebook,
             parameters=dict(
                 behavior_path=input.behavior,
+                model_outputs_path=input.model_outputs,
                 edges_path=input.edges,
                 trials_out=output.trials,
             ),
@@ -156,3 +168,45 @@ rule epoch_ecog:
         buffer_after=config["buffer_after"],
     script:
         "scripts/epoch_ecog.py"
+
+
+rule erps:
+    input:
+        epochs="results/{subject}/epochs/{band}-epo.fif",
+        notebook="notebooks/erps.py",
+    output:
+        notebook="results/{subject}/notebooks/erps_{band}.ipynb",
+    run:
+        run_notebook(
+            input.notebook,
+            output.notebook,
+            parameters=dict(epochs_path=input.epochs),
+        )
+
+
+rule patterns:
+    input:
+        epochs="results/{subject}/epochs/{band}-epo.fif",
+        notebook="notebooks/patterns.py",
+    output:
+        notebook="results/{subject}/notebooks/patterns_{band}.ipynb",
+    run:
+        run_notebook(
+            input.notebook,
+            output.notebook,
+            parameters=dict(epochs_path=input.epochs),
+        )
+
+
+rule prediction_error:
+    input:
+        epochs="results/{subject}/epochs/{band}-epo.fif",
+        notebook="notebooks/prediction_error.py",
+    output:
+        notebook="results/{subject}/notebooks/prediction_error_{band}.ipynb",
+    run:
+        run_notebook(
+            input.notebook,
+            output.notebook,
+            parameters=dict(epochs_path=input.epochs),
+        )
