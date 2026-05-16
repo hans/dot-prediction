@@ -50,22 +50,35 @@ _CONTRAST_THRESH: float = 40.0
 # iPad distance.  Set well below 100 so the smallest visible star passes.
 _MIN_AREA: int = 100
 
+# Minimum fraction of blue pixels in the annular region [2r, 4r] around a
+# candidate blob.  Stars sit on a solid blue background (≈1.0); fingers score
+# lower because the dark finger body fills part of the annulus.
+_MIN_BLUE_FRACTION: float = 0.5
+
 
 def detect_stars(
     frame: np.ndarray,
     min_area: int = _MIN_AREA,
+    min_blue_fraction: float = _MIN_BLUE_FRACTION,
 ) -> list[tuple[float, float, float]]:
     """Detect star blobs in a Tobii scene-camera frame.
 
     Args:
         frame: BGR image, uint8, shape (H, W, 3).
         min_area: Minimum blob area in pixels.
+        min_blue_fraction: Minimum fraction of blue pixels (from the raw HSV
+            mask, before morphological closing) in the annular region at
+            [2r, 4r] from each candidate centroid.  Only pixels inside the
+            display region count toward both numerator and denominator, so
+            blobs near screen edges are not unfairly penalised.
 
     Returns:
         List of (x, y, radius) tuples in frame-pixel coordinates, one per
         detected blob. ``radius`` is the equivalent circle radius
         (``sqrt(area / π)``). Returns an empty list when nothing is found.
     """
+    H_frame, W_frame = frame.shape[:2]
+
     # Step 1 — display-content mask via blue background
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     blue_mask = cv2.inRange(
@@ -94,6 +107,8 @@ def detect_stars(
         candidates, connectivity=8
     )
 
+    ys, xs = np.ogrid[:H_frame, :W_frame]
+
     blobs: list[tuple[float, float, float]] = []
     for i in range(1, n_labels):
         area = float(stats[i, cv2.CC_STAT_AREA])
@@ -102,6 +117,22 @@ def detect_stars(
         cx = float(centroids[i][0])
         cy = float(centroids[i][1])
         radius = float(np.sqrt(area / np.pi))
+
+        # Blue-coverage check: annulus [2r, 4r] around the blob should be
+        # predominantly blue in the raw mask (before MORPH_CLOSE fills holes).
+        # Denominator is restricted to display_region so edge blobs aren't
+        # penalised for annulus pixels that fall outside the screen content.
+        inner_r = 2.0 * radius
+        outer_r = 4.0 * radius
+        dist = np.hypot(xs - cx, ys - cy)
+        annular_mask = ((dist >= inner_r) & (dist < outer_r)).astype(np.uint8) * 255
+        annular_in_display = cv2.bitwise_and(annular_mask, display_region)
+        denom = np.count_nonzero(annular_in_display)
+        if denom > 0:
+            numer = np.count_nonzero(cv2.bitwise_and(blue_mask, annular_in_display))
+            if numer / denom < min_blue_fraction:
+                continue
+
         blobs.append((cx, cy, radius))
 
     return blobs

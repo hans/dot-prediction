@@ -141,6 +141,26 @@ def test_multiple_blobs_detected():
     assert _has_blob_near(blobs, *p2), f"Blob near {p2} missing"
 
 
+# ── blue-coverage filter ─────────────────────────────────────────────────────
+
+def test_min_blue_fraction_zero_accepts_star():
+    """min_blue_fraction=0.0 disables the blue check; star is still detected."""
+    cx, cy = 960, 540
+    frame = _blue_frame(blob_center=(cx, cy), blob_radius=20)
+    blobs = detect_stars(frame, min_blue_fraction=0.0)
+    assert _has_blob_near(blobs, cx, cy)
+
+
+def test_min_blue_fraction_impossible_rejects_star():
+    """min_blue_fraction > 1.0 rejects every blob, including a clean star."""
+    cx, cy = 960, 540
+    frame = _blue_frame(blob_center=(cx, cy), blob_radius=20)
+    blobs = detect_stars(frame, min_blue_fraction=1.1)
+    assert not _has_blob_near(blobs, cx, cy), (
+        "Impossible blue fraction threshold should reject all blobs"
+    )
+
+
 def test_bezel_not_detected():
     """White pixels outside the blue content region (bezels) are not returned."""
     # Add a white strip on both sides (simulated bezels), no blob in blue area
