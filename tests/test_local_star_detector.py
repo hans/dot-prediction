@@ -197,6 +197,70 @@ def test_floor_parameter():
     assert len(d_loose) == 1
 
 
+# ── adaptive window size ────────────────────────────────────────────────────
+
+def test_adaptive_window_shrinks_for_small_stars():
+    """Adaptive mode produces a window sized to the expected blob, not 40."""
+    # Two predictions ~20 px apart. With a fixed 40-px window both windows
+    # cover the same single blob; with an adaptive 12-px window (factor=4,
+    # expected_radius=3) each window is isolated.
+    frame = _blue_frame()
+    _paint_blob(frame, 800, 600, radius=2)
+    _paint_blob(frame, 820, 600, radius=2)
+    preds = [_pred(800, 600, expected_radius_px=3.0),
+             _pred(820, 600, expected_radius_px=3.0, tpt=1)]
+
+    # Fixed 40-px: both predictions overlap → same peak pixel.
+    d_fixed, _ = detect_in_windows(frame, preds, window_size_px=40)
+    assert len(d_fixed) == 2
+    assert len(find_overlapping_peaks(d_fixed)) == 1
+
+    # Adaptive: window ~12-px → no overlap.
+    d_adapt, _ = detect_in_windows(
+        frame, preds,
+        adaptive_radius_factor=4.0, min_window_px=8, max_window_px=40,
+    )
+    assert len(d_adapt) == 2
+    assert find_overlapping_peaks(d_adapt) == []
+    # Each centroid lands on its own blob (within 2 px).
+    for d, (cx, cy) in zip(d_adapt, [(800, 600), (820, 600)]):
+        fx, fy = d.frame_xy_subpix
+        assert np.hypot(fx - cx, fy - cy) < 2.0
+
+
+def test_adaptive_window_respects_min_clip():
+    """min_window_px floors the adaptive window for tiny expected_radius."""
+    frame = _blue_frame()
+    # Blob 16 px away from prediction — outside an 8-px window, inside a 40-px one.
+    _paint_blob(frame, 800, 600, radius=4)
+    pred = _pred(816, 600, expected_radius_px=4.0)   # 4 * 4 = 16
+
+    d_small_floor, _ = detect_in_windows(
+        frame, [pred],
+        adaptive_radius_factor=0.5, min_window_px=8, max_window_px=40,
+    )
+    d_big_floor, _ = detect_in_windows(
+        frame, [pred],
+        adaptive_radius_factor=0.5, min_window_px=40, max_window_px=40,
+    )
+    assert d_small_floor == []
+    assert len(d_big_floor) == 1
+
+
+def test_adaptive_window_respects_max_clip():
+    """max_window_px caps the adaptive window for huge expected_radius."""
+    frame = _blue_frame()
+    _paint_blob(frame, 800, 600, radius=4)
+    pred = _pred(800, 600, expected_radius_px=100.0)   # 4 * 100 = 400 → cap
+    dets, _ = detect_in_windows(
+        frame, [pred],
+        adaptive_radius_factor=4.0, min_window_px=10, max_window_px=20,
+    )
+    assert len(dets) == 1
+    # Equivalent radius bounded by what fits in a 20-px window (area ≤ 400).
+    assert dets[0].equivalent_radius_px <= np.sqrt(400 / np.pi)
+
+
 # ── overlap diagnostic ──────────────────────────────────────────────────────
 
 def test_overlapping_peaks_flagged():

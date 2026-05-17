@@ -39,8 +39,16 @@ video_path = f"/Users/jon/Projects/dot-prediction/data/{subject}/tobii/scenevide
 trials_path = f"results/{subject}/trials_with_video.parquet"
 align_path = f"results/{subject}/video_alignment.json"
 out_dir = f"results/{subject}/local_star_eval"
-window_size_px = 40       # spec's starting point; eval below shows when this is too small
+window_size_px = 40       # fixed window for raw / smoothed modes (covers H_rough translation error)
 floor = 20.0              # R-B opponent floor, permissive vs global detector's 40
+# Adaptive window for the anchor-corrected mode: trial-1 reveals cluster
+# within ~30 frame-px, so a fixed 40-px window makes all predictions overlap
+# and snap to the same blob. With anchor correction, H_rough residual is
+# small, so window ≈ 6 × expected_radius_px (≈12-15 px for fresh stars,
+# down to floor for very old ones) isolates each prediction.
+anchor_adaptive_factor = 6.0
+anchor_min_window_px = 10
+anchor_max_window_px = 40
 # Frames spanning the difficulty range
 eval_frames = [
     659,    # trial 0 start — very early, big star only
@@ -80,7 +88,11 @@ import pandas as pd
 
 from corner_smoother import smooth_corners
 from homography_refinement import anchor_translate
-from local_star_detector import detect_in_windows, find_overlapping_peaks  # noqa: F401
+from local_star_detector import (
+    _window_size_for,
+    detect_in_windows,
+    find_overlapping_peaks,
+)
 from predicted_positions import SCREEN_H, SCREEN_W, predicted_positions
 from screen_detection import detect_corners
 from star_detector import detect_stars
@@ -158,13 +170,28 @@ def big_star_anchor(predictions, global_blobs) -> tuple[tuple[float, float],
     return newest.screen_xy, (float(global_blobs[j][0]), float(global_blobs[j][1]))
 
 
+def detect_for_mode(frame, preds, mode: str):
+    """Detector call with per-mode window strategy.
+
+    raw / smoothed: fixed 40-px window (no anchor, must absorb H_rough bias).
+    smoothed+anchor: adaptive window scaled by expected_radius_px.
+    """
+    if mode == "smoothed+anchor":
+        return detect_in_windows(
+            frame, preds, window_size_px=window_size_px, floor=floor,
+            adaptive_radius_factor=anchor_adaptive_factor,
+            min_window_px=anchor_min_window_px,
+            max_window_px=anchor_max_window_px,
+        )
+    return detect_in_windows(frame, preds, window_size_px=window_size_px,
+                             floor=floor)
+
+
 def evaluate_one(fi: int, mode: str, H: np.ndarray, frame: np.ndarray,
                  expt_t: float, global_blobs) -> list[dict]:
     """Run prediction + local detection for one (frame, mode); return CSV rows."""
     preds = predicted_positions(expt_t, trials, H)
-    dets, unmatched = detect_in_windows(frame, preds,
-                                        window_size_px=window_size_px,
-                                        floor=floor)
+    dets, unmatched = detect_for_mode(frame, preds, mode)
     det_by_tpt = {d.source_prediction.tpt: d for d in dets}
 
     rows = []
@@ -230,8 +257,7 @@ for fi in eval_frames:
         rows = evaluate_one(fi, mode, H, frame, expt_t, global_blobs)
         # Count peak-pixel overlaps once per (frame, mode), attach to each row
         preds = predicted_positions(expt_t, trials, H)
-        dets, _ = detect_in_windows(frame, preds,
-                                    window_size_px=window_size_px, floor=floor)
+        dets, _ = detect_for_mode(frame, preds, mode)
         n_overlap_pairs = len(find_overlapping_peaks(dets))
         for r in rows:
             r["n_overlapping_peak_pairs"] = n_overlap_pairs
@@ -242,14 +268,18 @@ for fi in eval_frames:
     for mode, H in modes:
         if H is None: continue
         preds = predicted_positions(expt_t, trials, H)
-        dets, _ = detect_in_windows(frame, preds,
-                                    window_size_px=window_size_px, floor=floor)
+        dets, _ = detect_for_mode(frame, preds, mode)
         det_by_tpt = {d.source_prediction.tpt: d for d in dets}
         vis = frame.copy()
-        # Search windows
+        # Search windows — actual window used for each prediction
         for p in preds:
             cx, cy = int(p.frame_xy[0]), int(p.frame_xy[1])
-            half = window_size_px // 2
+            if mode == "smoothed+anchor":
+                w = _window_size_for(p, window_size_px, anchor_adaptive_factor,
+                                     anchor_min_window_px, anchor_max_window_px)
+            else:
+                w = window_size_px
+            half = w // 2
             cv2.rectangle(vis, (cx - half, cy - half), (cx + half, cy + half),
                           (60, 60, 60), 1)
             age_norm = min(p.age_s / 60, 1.0)
@@ -400,8 +430,7 @@ for fi in eval_frames:
                         (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 200, 200), 2)
             panels.append(blank); continue
         preds = predicted_positions(expt_t, trials, H)
-        dets, _ = detect_in_windows(frame, preds,
-                                    window_size_px=window_size_px, floor=floor)
+        dets, _ = detect_for_mode(frame, preds, label)
         panels.append(draw_candidate(frame, preds, dets, label))
     cv2.imwrite(str(out_path / f"candidate_f{fi:05d}.jpg"),
                 np.vstack(panels), [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -449,8 +478,7 @@ for fi in stab_frames:
     anchor = big_star_anchor(preds, global_blobs)
     H_use = anchor_translate(H_smo, anchor[0], anchor[1]) if anchor else H_smo
     preds = predicted_positions(expt_t, trials, H_use)
-    dets, _ = detect_in_windows(frame, preds, window_size_px=window_size_px,
-                                floor=floor)
+    dets, _ = detect_for_mode(frame, preds, "smoothed+anchor")
     for d in dets:
         if d.source_prediction.tpt == stab_tpt:
             stab_records.append(dict(frame=fi,

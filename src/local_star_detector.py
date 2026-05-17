@@ -78,21 +78,43 @@ def _window_bounds(cx: float, cy: float, win: int, W: int, H: int) -> tuple[int,
     return x0c, y0c, x1c, y1c
 
 
+def _window_size_for(
+    pred: PredictedStar,
+    window_size_px: int,
+    adaptive_radius_factor: float | None,
+    min_window_px: int,
+    max_window_px: int,
+) -> int:
+    """Choose the square window side length for a single prediction.
+
+    Fixed when ``adaptive_radius_factor`` is None; otherwise scaled to the
+    expected blob diameter and clipped to [min_window_px, max_window_px].
+    """
+    if adaptive_radius_factor is None:
+        return window_size_px
+    w = int(round(adaptive_radius_factor * pred.expected_radius_px))
+    return max(min_window_px, min(w, max_window_px))
+
+
 def detect_in_windows(
     frame: np.ndarray,
     predictions: list[PredictedStar],
     window_size_px: int = 40,
     floor: float = 20.0,
     max_radius_factor: float = 4.0,
+    adaptive_radius_factor: float | None = None,
+    min_window_px: int = 10,
+    max_window_px: int = 60,
 ) -> tuple[list[LocalDetection], list[PredictedStar]]:
     """Search the frame at each prediction for the predicted star.
 
     Args:
         frame: BGR image, uint8, shape (H, W, 3).
         predictions: List of PredictedStar from ``predicted_positions``.
-        window_size_px: Side length of the square search window in frame px.
-            Default 40 — the spec's starting point. Tune up if H_rough has
-            large bias and no anchor correction is applied.
+        window_size_px: Side length of the square search window in frame px,
+            used when ``adaptive_radius_factor`` is None. Default 40 —
+            the spec's starting point. Tune up if H_rough has large bias
+            and no anchor correction is applied.
         floor: Minimum R−B opponent-channel value inside the window for a
             pixel to count toward the centroid / area. The position prior
             does most discrimination, so this can be much lower than the
@@ -101,6 +123,15 @@ def detect_in_windows(
             larger than this × ``prediction.expected_radius_px``. Tuned
             generously (4.0×) because the size model is coarse — the goal
             is to reject finger-sized blobs only.
+        adaptive_radius_factor: When set, the window for each prediction
+            becomes ``factor × expected_radius_px`` (clipped to
+            [min_window_px, max_window_px]). Use with anchor-corrected
+            H_rough where residual translation error is small: tightens
+            the window to roughly the star's actual extent, eliminating
+            the "7 predictions all snap to the same blob" failure mode
+            when stars cluster within a fixed window's span.
+        min_window_px: Lower clip on adaptive window size.
+        max_window_px: Upper clip on adaptive window size.
 
     Returns:
         Tuple of (detections, unmatched_predictions). Each element of
@@ -117,7 +148,9 @@ def detect_in_windows(
 
     for pred in predictions:
         cx, cy = pred.frame_xy
-        bounds = _window_bounds(cx, cy, window_size_px, W, H)
+        win = _window_size_for(pred, window_size_px, adaptive_radius_factor,
+                               min_window_px, max_window_px)
+        bounds = _window_bounds(cx, cy, win, W, H)
         if bounds is None:
             unmatched.append(pred)
             continue
