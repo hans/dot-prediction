@@ -1,18 +1,3 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python 3 (ipykernel)
-#     language: python
-#     name: python3
-# ---
-
 # %% [markdown]
 # # Iterative homography refinement — Phase 1c sanity checks
 #
@@ -42,6 +27,11 @@ eval_frames = [659, 750, 1500, 1700, 1900, 2150, 2270]
 resolvable_frame = 1500  # clean mid-trial frame for the one-shot re-solve
 smoothing_window = 51
 smoothing_half_pad = 60
+# iterate_homography parameters (Viz 4+)
+phase1b_csv = f"results/{subject}/local_star_eval/local_star_eval.csv"
+k_max = 2
+convergence_px = 0.5
+window_size_px = 40  # fallback fixed window when adaptive is also set
 
 # %% [markdown]
 # ## Setup
@@ -79,6 +69,7 @@ from homography_refinement import (
     apply_quality_gates,
     anchor_translate,
     detect_constellation,
+    iterate_homography,
     solve_weighted_homography,
 )
 from local_star_detector import detect_in_windows, find_overlapping_peaks
@@ -539,6 +530,458 @@ if shifts:
           f"{(shift_df.improvement_px > 0).mean():.0%}")
 else:
     print("No matched (detected + refined) stars to compare.")
+
+# %% [markdown]
+# ## Viz 4 — Full `iterate_homography` evaluation
+#
+# Runs the complete iterate_homography loop on all 7 eval frames, recording
+# per-(frame, mode, iteration_k, tpt) data. Two modes:
+#
+# - **anchor**: big-star anchor supplied from the global detector.
+# - **no_anchor**: no anchor; starts from the corner-only H_v0.
+#
+# Frames that exit with `"no_predictions"` (e.g. inter-trial gap f2270) produce
+# no rows.
+
+# %%
+def _project_corners_h(H: np.ndarray) -> np.ndarray:
+    sc = SCREEN_CORNERS_NP.astype(np.float64)
+    ones = np.ones((4, 1))
+    h = (H @ np.hstack([sc, ones]).T).T
+    return h[:, :2] / h[:, 2:3]
+
+
+def _h_delta_px(H_in: np.ndarray, H_out: np.ndarray) -> float:
+    proj_in = _project_corners_h(H_in)
+    proj_out = _project_corners_h(H_out)
+    return float(np.max(np.hypot(*(proj_out - proj_in).T)))
+
+
+def rows_from_result(fi, expt_t, result, big_star_frame_xy, mode):
+    """Flatten an IterationResult into one row per (iteration_k, tpt)."""
+    rows = []
+    for k, step in enumerate(result.steps):
+        small_star_residuals = {}
+        for c, res in zip(step.correspondences, step.solve_result.residuals_px):
+            if c.source == "small_star":
+                small_star_residuals[c.screen_xy] = float(res)
+
+        accepted_by_tpt = {d.source_prediction.tpt: d for d in step.detections}
+        rejected_by_tpt = {r.detection.source_prediction.tpt: r.reason
+                           for r in step.rejections}
+        h_delta = _h_delta_px(step.H_in, step.H_out)
+        n_same_blob = sum(1 for r in step.rejections if r.reason == "same_blob")
+        n_radius_rej = sum(1 for r in step.rejections if r.reason == "radius_mismatch")
+
+        for pred in step.predictions:
+            det = accepted_by_tpt.get(pred.tpt)
+            rej_reason = rejected_by_tpt.get(pred.tpt)
+            dist_anchor = (
+                float(np.hypot(pred.frame_xy[0] - big_star_frame_xy[0],
+                               pred.frame_xy[1] - big_star_frame_xy[1]))
+                if big_star_frame_xy is not None else np.nan
+            )
+            if det is not None:
+                status = "accepted"
+            elif rej_reason is not None:
+                status = rej_reason
+            else:
+                status = "unmatched"
+            rows.append(dict(
+                frame_idx=fi, expt_t_ms=expt_t, mode=mode, iteration_k=k,
+                trial_idx=pred.trial_idx, tpt=pred.tpt,
+                age_s=pred.age_s, expected_radius_px=pred.expected_radius_px,
+                predicted_frame_x=pred.frame_xy[0], predicted_frame_y=pred.frame_xy[1],
+                distance_from_anchor_px=dist_anchor,
+                status=status, detected=det is not None,
+                detected_frame_x=(det.frame_xy_subpix[0] if det else np.nan),
+                detected_frame_y=(det.frame_xy_subpix[1] if det else np.nan),
+                confidence=(det.confidence if det else np.nan),
+                equivalent_radius_px=(det.equivalent_radius_px if det else np.nan),
+                reprojection_error_px=small_star_residuals.get(pred.screen_xy, np.nan),
+                h_delta_px=h_delta,
+                anchor_less=result.anchor_less, iterations_run=result.iterations_run,
+                convergence_reason=result.convergence_reason,
+                n_same_blob_rejected=n_same_blob, n_radius_rejected=n_radius_rej,
+            ))
+    return rows
+
+
+records4: list[dict] = []
+frame_results4: dict = {}
+
+for fi in eval_frames:
+    frame = read_frame(fi)
+    if frame is None:
+        print(f"frame {fi}: read fail"); continue
+    expt_t = frame_to_expt_t(fi)
+    print(f"\nframe {fi}: expt_t={expt_t:.0f} ms")
+
+    cache_idx = fi - lo
+    raw_c = raw_corners_list[cache_idx]
+    smo_c = smoothed_corners[cache_idx]
+    if smo_c is None:
+        print(f"  frame {fi}: no smoothed corners; skipping"); continue
+
+    global_blobs = detect_stars(frame)
+    print(f"  global blobs: {len(global_blobs)}")
+
+    # Compute H_v0 from smoothed corners to generate initial predictions for anchor.
+    H_v0_for_anchor, _ = cv2.findHomography(
+        SCREEN_CORNERS_NP.astype(np.float32),
+        smo_c.astype(np.float32),
+        method=0,
+    )
+    preds_init = predicted_positions(expt_t, trials, H_v0_for_anchor)
+    anchor = big_star_anchor(preds_init, global_blobs)
+    big_screen_xy, big_frame_xy = anchor if anchor else (None, None)
+    print(f"  anchor found: {anchor is not None}")
+
+    sc64 = SCREEN_CORNERS_NP.astype(np.float64)
+
+    result_anchor = iterate_homography(
+        frame, smo_c, sc64, trials, expt_t,
+        raw_corners=raw_c,
+        big_star_screen_xy=big_screen_xy,
+        big_star_frame_xy=big_frame_xy,
+        k_max=k_max, convergence_px=convergence_px, floor=floor,
+        window_size_px=window_size_px,
+        adaptive_radius_factor=anchor_adaptive_factor,
+    )
+    print(f"  anchor: iters={result_anchor.iterations_run}, "
+          f"reason={result_anchor.convergence_reason}, "
+          f"anchor_less={result_anchor.anchor_less}")
+    records4.extend(rows_from_result(fi, expt_t, result_anchor, big_frame_xy, "anchor"))
+
+    result_noanchor = iterate_homography(
+        frame, smo_c, sc64, trials, expt_t,
+        raw_corners=raw_c,
+        k_max=k_max, convergence_px=convergence_px, floor=floor,
+        window_size_px=window_size_px,
+        adaptive_radius_factor=anchor_adaptive_factor,
+    )
+    print(f"  no_anchor: iters={result_noanchor.iterations_run}, "
+          f"reason={result_noanchor.convergence_reason}")
+    records4.extend(rows_from_result(fi, expt_t, result_noanchor, big_frame_xy, "no_anchor"))
+
+    frame_results4[fi] = {
+        "anchor": result_anchor, "no_anchor": result_noanchor,
+        "big_frame_xy": big_frame_xy, "global_blobs": global_blobs,
+        "frame": frame, "smo_c": smo_c, "raw_c": raw_c,
+    }
+
+eval_df = pd.DataFrame(records4)
+csv_path = out_path / "iterative_homography_eval.csv"
+eval_df.to_csv(csv_path, index=False)
+print(f"\nSaved {len(eval_df)} rows → {csv_path}")
+
+
+# %% [markdown]
+# ## Detection rate by iteration
+#
+# Within each mode, detection rate should be monotonically non-decreasing across
+# iterations. Pooled over all eval frames that had predictions.
+
+# %%
+if not eval_df.empty:
+    detect_by_iter = (
+        eval_df
+        .groupby(["mode", "iteration_k"])
+        .apply(lambda g: g["detected"].mean(), include_groups=False)
+        .rename("detect_rate")
+        .reset_index()
+    )
+    print("Detection rate by (mode, iteration_k):\n")
+    print(detect_by_iter.to_string(index=False))
+
+    print("\nDetection rate per frame per iteration (anchor mode):\n")
+    anchor_df = eval_df[eval_df["mode"] == "anchor"]
+    if not anchor_df.empty:
+        print(anchor_df.groupby(["frame_idx", "iteration_k"])
+              .apply(lambda g: g["detected"].mean(), include_groups=False)
+              .rename("detect_rate")
+              .unstack("iteration_k")
+              .to_string())
+else:
+    print("No data rows recorded (all frames had no predictions).")
+
+
+# %% [markdown]
+# ## Detection rate vs distance from anchor
+#
+# The key Phase 1b failure: under H_rough_anchor, predictions far from the anchor
+# accumulated perspective residual. After full-perspective refinement this should
+# be flat. Pooled over anchor-mode, non-anchor-less frames.
+
+# %%
+df_anchored = eval_df[
+    (eval_df["mode"] == "anchor")
+    & (~eval_df["anchor_less"])
+    & eval_df["distance_from_anchor_px"].notna()
+].copy()
+
+dist_bins = [0, 50, 100, 150, 200, 300, 600]
+dist_labels = ["0–50", "50–100", "100–150", "150–200", "200–300", "300+"]
+
+if not df_anchored.empty:
+    df_anchored["dist_bucket"] = pd.cut(
+        df_anchored["distance_from_anchor_px"],
+        bins=dist_bins, labels=dist_labels, right=False,
+    )
+    dist_rate = (
+        df_anchored
+        .groupby(["iteration_k", "dist_bucket"], observed=False)["detected"]
+        .agg(["sum", "size"])
+        .assign(rate=lambda d: d["sum"] / d["size"].clip(lower=1))
+    )
+    print("Detection rate by (iteration_k, distance_from_anchor bucket):\n")
+    print(dist_rate.to_string())
+
+    n_iters = df_anchored["iteration_k"].nunique()
+    if n_iters > 0:
+        fig, axes = plt.subplots(1, n_iters, figsize=(5 * n_iters, 4), sharey=True)
+        if n_iters == 1:
+            axes = [axes]
+        for ax, (k, grp) in zip(axes, dist_rate.groupby("iteration_k")):
+            grp_by_bucket = grp.droplevel("iteration_k")
+            ax.bar(range(len(grp_by_bucket)), grp_by_bucket["rate"],
+                   tick_label=grp_by_bucket.index.tolist())
+            ax.set_ylim(0, 1.05)
+            ax.set_xlabel("Distance from anchor (frame px)")
+            ax.set_ylabel("Detection rate")
+            ax.set_title(f"Iteration k={k}")
+            ax.tick_params(axis="x", rotation=30)
+        fig.suptitle("Detection rate vs distance from anchor (anchor mode)")
+        plt.tight_layout()
+        plt.savefig(str(out_path / "v4_detect_rate_vs_distance.png"), dpi=100)
+        plt.show()
+else:
+    print("No anchor-mode, non-anchor-less rows with distance data.")
+
+
+# %% [markdown]
+# ## Same-blob-snapping rate per iteration
+#
+# Count of `"same_blob"` rejections per frame per iteration. Should drop between
+# iterations as predictions converge onto distinct blobs under the improved H.
+
+# %%
+if not eval_df.empty:
+    snap_df = (
+        eval_df[["frame_idx", "mode", "iteration_k",
+                  "n_same_blob_rejected", "n_radius_rejected"]]
+        .drop_duplicates(subset=["frame_idx", "mode", "iteration_k"])
+        .sort_values(["mode", "frame_idx", "iteration_k"])
+    )
+    print("Same-blob + radius rejections per (frame, mode, iteration_k):\n")
+    print(snap_df.to_string(index=False))
+
+    snap_pivot = (
+        snap_df
+        .groupby(["mode", "iteration_k"])[["n_same_blob_rejected", "n_radius_rejected"]]
+        .mean()
+        .round(2)
+    )
+    print("\nMean rejections per frame by (mode, iteration_k):\n")
+    print(snap_pivot.to_string())
+
+
+# %% [markdown]
+# ## Homography reprojection error
+#
+# Per-correspondence reprojection error for accepted small-star correspondences.
+# Lower is better; <2 px median is the target.
+
+# %%
+reproj_df = eval_df[
+    (eval_df["status"] == "accepted")
+    & eval_df["reprojection_error_px"].notna()
+]
+
+if not reproj_df.empty:
+    reproj_stats = (
+        reproj_df
+        .groupby(["mode", "iteration_k"])["reprojection_error_px"]
+        .agg(["median", lambda x: x.quantile(0.95)])
+        .rename(columns={"median": "median_px", "<lambda_0>": "p95_px"})
+        .round(3)
+    )
+    print("Reprojection error — accepted small-star correspondences:\n")
+    print(reproj_stats.to_string())
+
+    groups = list(reproj_df.groupby(["mode", "iteration_k"]))
+    labels_box = [f"{mode}\nk={k}" for (mode, k), _ in groups]
+    data_box = [grp["reprojection_error_px"].dropna().values for _, grp in groups]
+
+    fig, ax = plt.subplots(figsize=(max(6, len(labels_box) * 1.5 + 1), 4))
+    ax.boxplot(data_box, labels=labels_box, showfliers=False)
+    ax.set_ylabel("Reprojection error (frame px)")
+    ax.set_title("Small-star reprojection error per mode × iteration")
+    ax.axhline(2.0, color="tomato", linestyle="--", linewidth=1, label="2 px target")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(str(out_path / "v4_reprojection_error.png"), dpi=100)
+    plt.show()
+else:
+    print("No accepted small-star correspondences with reprojection data.")
+
+
+# %% [markdown]
+# ## Side-by-side with Phase 1b
+#
+# Phase 1b's best mode is `smoothed+anchor`; Phase 1c uses the final iteration
+# of the `anchor` mode. Compared per (frame_idx, tpt).
+
+# %%
+from pathlib import Path as _Path
+
+_p1b_path = _Path(phase1b_csv)
+if _p1b_path.exists() and not eval_df.empty:
+    p1b = pd.read_csv(_p1b_path)
+    p1b_best = (
+        p1b[p1b["H_rough_mode"] == "smoothed+anchor"][["frame_idx", "tpt", "source"]]
+        .assign(detected_1b=lambda d: d["source"] == "local")
+    )
+
+    # Phase 1c final iteration per frame (transform avoids index ambiguity)
+    _anchor = eval_df[eval_df["mode"] == "anchor"].copy()
+    _max_k = _anchor.groupby("frame_idx")["iteration_k"].transform("max")
+    p1c_final = (
+        _anchor[_anchor["iteration_k"] == _max_k]
+        [["frame_idx", "tpt", "detected"]]
+        .rename(columns={"detected": "detected_1c"})
+    )
+
+    comparison = p1b_best.merge(p1c_final, on=["frame_idx", "tpt"], how="outer")
+
+    print("Detection rate comparison — Phase 1b (smoothed+anchor) vs Phase 1c (final):\n")
+    summary = (
+        comparison
+        .groupby("frame_idx")[["detected_1b", "detected_1c"]]
+        .mean()
+        .round(3)
+        .assign(delta=lambda d: (d["detected_1c"] - d["detected_1b"]).round(3))
+    )
+    print(summary.to_string())
+    print(f"\nOverall — Phase 1b: {comparison['detected_1b'].mean():.3f}, "
+          f"Phase 1c: {comparison['detected_1c'].mean():.3f}")
+else:
+    print(f"Phase 1b CSV not found at {phase1b_csv}; skipping comparison.")
+
+
+# %% [markdown]
+# ## Per-iteration overlays
+#
+# One JPEG per eval frame with anchor-mode iterations stacked vertically.
+# Per panel:
+# - **Gray rectangle**: adaptive search window.
+# - **Colored cross**: predicted position (blue=fresh, red=old by age).
+# - **Green circle**: accepted detection.
+# - **Orange circle**: rejected detection (label = reason abbreviation).
+# - **Cyan circle**: global big-star blob.
+# - Header text: frame, mode, iteration k, detection count, H-delta.
+
+# %%
+def _draw_iter_panel(
+    frame: np.ndarray,
+    step,
+    big_frame_xy,
+    global_blobs,
+    label: str,
+) -> np.ndarray:
+    vis = frame.copy()
+    accepted_by_tpt = {d.source_prediction.tpt: d for d in step.detections}
+    rejected_by_tpt = {r.detection.source_prediction.tpt: r for r in step.rejections}
+
+    for pred in step.predictions:
+        cx, cy = int(round(pred.frame_xy[0])), int(round(pred.frame_xy[1]))
+        age_norm = min(pred.age_s / 60.0, 1.0)
+        cross_col = (int(255 * (1 - age_norm)), 30, int(255 * age_norm))
+
+        # Window outline (adaptive if possible)
+        if anchor_adaptive_factor is not None and pred.expected_radius_px > 0:
+            w = int(np.clip(
+                anchor_adaptive_factor * pred.expected_radius_px,
+                anchor_min_window_px, anchor_max_window_px,
+            ))
+        else:
+            w = window_size_px
+        half = w // 2
+        cv2.rectangle(vis, (cx - half, cy - half), (cx + half, cy + half),
+                      (70, 70, 70), 1)
+        cv2.drawMarker(vis, (cx, cy), cross_col, cv2.MARKER_TILTED_CROSS, 12, 1)
+
+        det = accepted_by_tpt.get(pred.tpt)
+        rej = rejected_by_tpt.get(pred.tpt)
+        if det is not None:
+            fx, fy = int(round(det.frame_xy_subpix[0])), int(round(det.frame_xy_subpix[1]))
+            cv2.circle(vis, (fx, fy), 8, (0, 220, 0), 2)
+        elif rej is not None:
+            fx = int(round(rej.detection.frame_xy_subpix[0]))
+            fy = int(round(rej.detection.frame_xy_subpix[1]))
+            cv2.circle(vis, (fx, fy), 8, (0, 140, 255), 2)
+            cv2.putText(vis, rej.reason[:2], (fx + 10, fy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 140, 255), 1)
+        else:
+            cv2.line(vis, (cx - 5, cy - 5), (cx + 5, cy + 5), (50, 50, 200), 1)
+            cv2.line(vis, (cx - 5, cy + 5), (cx + 5, cy - 5), (50, 50, 200), 1)
+
+    for bx, by, br in global_blobs:
+        cv2.circle(vis, (int(bx), int(by)), max(int(br), 5), (255, 220, 0), 2)
+
+    n_det = len(accepted_by_tpt)
+    n_pred = len(step.predictions)
+    h_delta = _h_delta_px(step.H_in, step.H_out)
+    cv2.putText(vis, label, (14, 36),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+    cv2.putText(vis, f"det={n_det}/{n_pred}  Hdelta={h_delta:.2f}px",
+                (14, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 220, 100), 2)
+    return vis
+
+
+for fi, fr_data in frame_results4.items():
+    fr = fr_data["frame"]
+    big_frame_xy = fr_data["big_frame_xy"]
+    global_blobs = fr_data["global_blobs"]
+
+    panels = []
+    for mode_key, mode_label in [("anchor", "anchor"), ("no_anchor", "no_anchor")]:
+        result = fr_data[mode_key]
+        if not result.steps:
+            blank = np.full_like(fr, 25)
+            cv2.putText(blank, f"f{fi}  {mode_label}: {result.convergence_reason}",
+                        (14, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (200, 200, 200), 2)
+            panels.append(blank)
+            continue
+        for k, step in enumerate(result.steps):
+            label = f"f{fi}  {mode_label}  k={k}  [{result.convergence_reason}]"
+            panels.append(_draw_iter_panel(fr, step, big_frame_xy, global_blobs, label))
+
+    if panels:
+        cv2.imwrite(
+            str(out_path / f"v4_f{fi:05d}_iters.jpg"),
+            np.vstack(panels),
+            [cv2.IMWRITE_JPEG_QUALITY, 88],
+        )
+
+print(f"Overlays written to {out_path}/v4_f*_iters.jpg")
+
+
+# %% [markdown]
+# ### Inline: iteration overlays
+
+# %%
+for p in sorted(out_path.glob("v4_f*_iters.jpg")):
+    img = cv2.imread(str(p))
+    if img is None:
+        continue
+    fig, ax = plt.subplots(figsize=(14, 14 * img.shape[0] / img.shape[1]))
+    ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    ax.set_title(p.name)
+    ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
 
 cap.release()
 print("\nDone.")
