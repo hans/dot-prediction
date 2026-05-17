@@ -69,6 +69,10 @@ def check1_findhomography_stability():
     frame correspondences, add Gaussian noise to the frame side, re-solve,
     and measure the projection error of the 4 screen corners under the
     re-solved H. Report median / p95 over many noise realizations.
+
+    Runs each N>=6 case under both method=0 (lstsq) and RANSAC
+    (ransacReprojThreshold=3.0) so the stability conclusions match the actual
+    production solver path used by solve_weighted_homography.
     """
     print("\n=== Check 1: findHomography stability under input perturbation ===\n")
 
@@ -77,7 +81,6 @@ def check1_findhomography_stability():
     # Take a real H from frame 1500 of EC347 (Phase 1b reported clean
     # detection there). Use the bare smoothed corners — perfect input.
     cap = cv2.VideoCapture(VIDEO)
-    fps = cap.get(cv2.CAP_PROP_FPS)
     # Build a tiny smoothing window
     fi_ref = 1500
     raw_window: list = []
@@ -105,51 +108,74 @@ def check1_findhomography_stability():
     ])
 
     cases = [
-        ("4 corners only", screen_corners, [1.0, 1.0, 1.0, 1.0]),
-        ("4 corners + 6 stars", np.vstack([screen_corners, extra_screen[:6]]), None),
-        ("4 corners + 10 stars", np.vstack([screen_corners, extra_screen[:10]]), None),
-        ("6 stars only (no corners)", extra_screen[:6], None),
-        ("10 stars only (no corners)", extra_screen[:10], None),
+        ("4 corners only", screen_corners),
+        ("4 corners + 6 stars", np.vstack([screen_corners, extra_screen[:6]])),
+        ("4 corners + 10 stars", np.vstack([screen_corners, extra_screen[:10]])),
+        ("6 stars only (no corners)", extra_screen[:6]),
+        ("10 stars only (no corners)", extra_screen[:10]),
+    ]
+
+    # Production solver: lstsq when N<6, RANSAC(3.0) when N>=6.
+    # Run both for N>=6 cases so the stability conclusions match reality.
+    solvers = [
+        ("lstsq", 0, None),
+        ("RANSAC", cv2.RANSAC, 3.0),
     ]
 
     noise_sigmas_px = [0.25, 0.5, 1.0, 2.0]
     n_trials = 500
 
-    print(f"{'Case':<28s} {'σ_in':>6s}  {'med_corner_err':>14s}  {'p95_corner_err':>14s}  {'fail_rate':>9s}")
-    for label, screen_pts, _w in cases:
+    proj_true = _project(H_true, screen_corners)
+
+    print(f"{'Case':<28s} {'solver':<6s} {'σ_in':>6s}  {'med_corner_err':>14s}  {'p95_corner_err':>14s}  {'fail_rate':>9s}")
+    for label, screen_pts in cases:
+        n_pts = len(screen_pts)
         frame_pts_clean = _project(H_true, screen_pts)
-        for sigma in noise_sigmas_px:
-            errs = []
-            failures = 0
-            for _ in range(n_trials):
-                noise = rng.normal(scale=sigma, size=frame_pts_clean.shape)
-                noisy = frame_pts_clean + noise
-                H_solved, _ = cv2.findHomography(
-                    screen_pts.astype(np.float32),
-                    noisy.astype(np.float32),
-                    method=0,
+        for solver_label, method, ransac_thresh in solvers:
+            if method == cv2.RANSAC and n_pts < 6:
+                continue
+            for sigma in noise_sigmas_px:
+                errs = []
+                failures = 0
+                for _ in range(n_trials):
+                    noise = rng.normal(scale=sigma, size=frame_pts_clean.shape)
+                    noisy = frame_pts_clean + noise
+                    if ransac_thresh is not None:
+                        H_solved, _ = cv2.findHomography(
+                            screen_pts.astype(np.float32),
+                            noisy.astype(np.float32),
+                            method=method,
+                            ransacReprojThreshold=ransac_thresh,
+                        )
+                    else:
+                        H_solved, _ = cv2.findHomography(
+                            screen_pts.astype(np.float32),
+                            noisy.astype(np.float32),
+                            method=method,
+                        )
+                    if H_solved is None:
+                        failures += 1
+                        continue
+                    # Measure: re-project the 4 *true* screen corners under
+                    # H_solved and compare with their true frame positions.
+                    proj_under = _project(H_solved, screen_corners)
+                    d = np.hypot(*(proj_under - proj_true).T)
+                    errs.append(d.max())
+                arr = np.array(errs)
+                print(
+                    f"{label:<28s} {solver_label:<6s} {sigma:>6.2f}  "
+                    f"{np.median(arr):>14.3f}  {np.quantile(arr, 0.95):>14.3f}  "
+                    f"{failures / n_trials:>9.1%}"
                 )
-                if H_solved is None:
-                    failures += 1
-                    continue
-                # Measure: re-project the 4 *true* screen corners under
-                # H_solved and compare with their true frame positions.
-                proj_under = _project(H_solved, screen_corners)
-                proj_true = _project(H_true, screen_corners)
-                d = np.hypot(*(proj_under - proj_true).T)
-                errs.append(d.max())
-            arr = np.array(errs)
-            print(
-                f"{label:<28s} {sigma:>6.2f}  "
-                f"{np.median(arr):>14.3f}  {np.quantile(arr, 0.95):>14.3f}  "
-                f"{failures / n_trials:>9.1%}"
-            )
 
     print(
         "\n  Interpretation: max corner re-projection error (px) under H_solved.\n"
         "  Sub-px input noise should give sub-px-ish corner error for 6+ point\n"
         "  cases; 4-pt should amplify noise but stay bounded. >2x amplification\n"
-        "  suggests RANSAC or weighting is needed even on clean data."
+        "  suggests RANSAC or weighting is needed even on clean data.\n"
+        "  RANSAC rows show how the production solver path behaves; compare with\n"
+        "  lstsq rows to see whether inlier filtering helps or hurts under pure\n"
+        "  Gaussian noise (no outliers) vs. the original lstsq results."
     )
 
 

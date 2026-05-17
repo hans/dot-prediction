@@ -79,29 +79,54 @@ driver in `scripts/preflight_phase1c.py`.
 
 500 trials of perturbing frame-side correspondences with Gaussian noise and
 re-solving H; measured = max corner re-projection error (px) of the 4 screen
-corners under the noisy-solved H vs. clean-solved H.
+corners under the noisy-solved H vs. clean-solved H. A second sweep was run
+with `method=cv2.RANSAC, ransacReprojThreshold=3.0` (the production solver
+path for N≥6) to check whether RANSAC's inlier filtering helps or hurts under
+pure Gaussian noise (no true outliers).
+
+**lstsq (method=0):**
 
 | Inputs | σ_in = 0.25 px | σ_in = 0.5 px | σ_in = 1.0 px | σ_in = 2.0 px |
 |---|---:|---:|---:|---:|
 | 4 corners only | 0.48 / 0.71 | 0.99 / 1.45 | 1.86 / 2.94 | 3.78 / 5.91 |
 | 4 corners + 6 stars | 0.40 / 0.64 | 0.82 / 1.29 | 1.62 / 2.73 | 3.18 / 5.20 |
-| 4 corners + 10 stars | 0.37 / 0.60 | 0.76 / 1.35 | 1.54 / 2.42 | 3.07 / 5.19 |
-| **6 stars only (no corners)** | **3.23 / 6.53** | 6.75 / 13.97 | 13.95 / 28.33 | 26.11 / 54.99 |
-| **10 stars only (no corners)** | **2.02 / 4.42** | 4.21 / 8.41 | 8.00 / 17.76 | 16.57 / 35.79 |
+| 4 corners + 10 stars | 0.37 / 0.61 | 0.77 / 1.29 | 1.45 / 2.43 | 3.03 / 5.00 |
+| **6 stars only (no corners)** | **3.26 / 6.50** | 6.36 / 13.59 | 12.82 / 28.92 | 25.76 / 57.41 |
+| **10 stars only (no corners)** | **2.09 / 4.38** | 4.08 / 8.79 | 7.97 / 17.64 | 16.81 / 35.99 |
+
+**RANSAC (ransacReprojThreshold=3.0), N≥6 cases only:**
+
+| Inputs | σ_in = 0.25 px | σ_in = 0.5 px | σ_in = 1.0 px | σ_in = 2.0 px |
+|---|---:|---:|---:|---:|
+| 4 corners + 6 stars | 0.42 / 0.64 | 0.80 / 1.30 | **1.74 / 6.91** | **4.88 / 61.3** |
+| 4 corners + 10 stars | 0.65 / 2.38 | 1.39 / 5.41 | **3.31 / 13.2** | **13.5 / 60.9** |
+| 6 stars only (no corners) | 3.55 / 10.1 | 9.09 / 34.9 | 18.9 / 73.3 | 50.4 / 349 |
+| 10 stars only (no corners) | 2.14 / 4.12 | 4.12 / 9.29 | 9.25 / 21.7 | 26.4 / 80.0 |
 
 Values are median / p95 max-corner-error in frame px.
 
 **Implications:**
 - Sub-pixel input noise on corners + stars amplifies ~1.6× into corner
-  re-projection error — a comfortable noise floor. Iteration converges.
+  re-projection error under lstsq — a comfortable noise floor. Iteration
+  converges.
 - **Stars without corners are an order of magnitude worse**, because EC347's
   star constellation fits inside the central ~70% of the screen — DLT cannot
   extrapolate well to the corners. **The original spec's "drop corners
   entirely once enough stars are confirmed" fallback is rejected**; corners
   are always needed to pin the perspective at the screen edges.
-- More than 6 stars adds little numerical benefit (1.54 vs 1.62 px at σ=1.0).
-  More stars buys robustness to bad correspondences (RANSAC outlier rejection),
-  not noise reduction.
+- More than 6 stars adds little numerical benefit under lstsq (1.45 vs 1.62
+  px at σ=1.0). More stars buys robustness to bad correspondences, not noise
+  reduction.
+- **RANSAC hurts under pure Gaussian noise.** With no true outliers, the 3 px
+  threshold randomly excludes good correspondences when noise pushes their
+  reprojection error past the cutoff, occasionally leaving a near-degenerate
+  point set. At σ=1.0 the p95 is 2.5–5× worse than lstsq; at σ=2.0 it is
+  10–12× worse. The median is similar at σ≤0.5 but diverges at higher noise.
+  **If the quality gates do their job** (blob-conflict + radius check remove
+  the bad correspondences before the re-solve), the remaining inputs are clean
+  Gaussian noise — exactly the regime where lstsq beats RANSAC. Use lstsq as
+  the default; fall back to RANSAC only if eval shows catastrophic H estimates
+  that survived the gates (see Risk section).
 
 ### 2. Bottom-corner trustworthiness
 
@@ -159,10 +184,19 @@ have 5-10× worse extrapolation error at the screen edges than star+corner
 solves, because the constellation is centrally concentrated. The corners
 do real work pinning the perspective extrapolation.
 
-Solve via `cv2.findHomography(method=cv2.RANSAC, ransacReprojThreshold=3.0)`
-once correspondences ≥ 6 (so RANSAC has the dof to drop outliers); else
-`method=0` for least-squares. Weighting via repeated points is a simple
-first cut; hand-rolled weighted DLT can come later if needed.
+Solve via `method=0` (lstsq) regardless of correspondence count. Pre-flight
+check 1 shows that under pure Gaussian noise — the expected regime after the
+quality gates remove bad correspondences — lstsq has the same median error as
+RANSAC at low noise (σ≤0.5 px) but 3–12× lower p95 at σ≥1 px. RANSAC's
+inlier-filtering randomly excludes good points when noise pushes their
+reprojection past the 3 px threshold, occasionally landing on a degenerate
+subset. Weighting via repeated points is a simple first cut; hand-rolled
+weighted DLT can come later if needed.
+
+**RANSAC watchlist:** If eval surfaces frames where a bad correspondence
+clearly slipped through the gates and destabilized H, switch those cases to
+`ransacReprojThreshold=3.0`. Do not enable RANSAC globally before seeing that
+evidence — the p95 penalty on clean frames is too high.
 
 ### Change 2 — Iteration count
 
