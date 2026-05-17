@@ -1,5 +1,6 @@
 """Unit tests for homography_refinement."""
 
+import cv2
 import numpy as np
 import pytest
 
@@ -8,11 +9,12 @@ from src.homography_refinement import (
     GateRejection,
     anchor_translate,
     apply_quality_gates,
+    detect_constellation,
     radius_match_ok,
     resolve_blob_conflicts,
     solve_weighted_homography,
 )
-from src.local_star_detector import LocalDetection
+from src.local_star_detector import LocalDetection, detect_in_windows
 from src.predicted_positions import PredictedStar
 
 
@@ -120,15 +122,15 @@ def _max_corner_reproj_error(H_est: np.ndarray) -> float:
     return float(np.hypot(*(pred - got).T).max())
 
 
-def test_solver_recovers_clean_homography_via_ransac():
-    """6 noise-free unit-weight correspondences → H within sub-pixel."""
+def test_solver_recovers_clean_homography_via_lstsq():
+    """6 noise-free unit-weight correspondences → H within sub-pixel (lstsq default)."""
     screen = np.array([
         [0.0, 0.0], [2388.0, 0.0], [2388.0, 1668.0], [0.0, 1668.0],
         [1200.0, 800.0], [800.0, 1200.0],
     ])
     corrs = _make_correspondences(screen)
     res = solve_weighted_homography(corrs)
-    assert res.method == "ransac"
+    assert res.method == "lstsq"
     assert res.inlier_mask.all()
     assert res.residuals_px.max() < 1e-3
     assert _max_corner_reproj_error(res.H) < 1e-2
@@ -155,7 +157,7 @@ def test_solver_ransac_rejects_outlier():
     offsets = np.zeros((7, 2))
     offsets[-1] = [80.0, -60.0]  # last point: 100 px off, pure noise
     corrs = _make_correspondences(screen, frame_offsets=offsets)
-    res = solve_weighted_homography(corrs, ransac_threshold_px=3.0)
+    res = solve_weighted_homography(corrs, use_ransac=True, ransac_threshold_px=3.0)
     assert res.method == "ransac"
     assert not res.inlier_mask[-1], "outlier should be excluded"
     assert res.inlier_mask[:-1].all(), "clean points should all be inliers"
@@ -394,3 +396,250 @@ def test_apply_quality_gates_radius_runs_before_blob_resolver():
     assert accepted == [d_good]
     reasons = sorted(r.reason for r in rejections)
     assert reasons == ["radius_mismatch"]
+
+
+# ---------------------------------------------------------------------------
+# Greedy constellation matcher (Phase 1c Step 3)
+# ---------------------------------------------------------------------------
+
+_FRAME_H, _FRAME_W = 1080, 1920
+
+
+def _blue_frame() -> np.ndarray:
+    """Blue background like the iPad task display (BGR=140,50,50)."""
+    return np.full((_FRAME_H, _FRAME_W, 3), (140, 50, 50), dtype=np.uint8)
+
+
+def _paint_blob(frame: np.ndarray, cx: int, cy: int, radius: int = 4,
+                color=(120, 175, 180)) -> None:
+    cv2.circle(frame, (cx, cy), radius, color, -1)
+
+
+def _pred_full(frame_xy: tuple[float, float], *,
+               expected_radius_px: float = 5.0, tpt: int = 0) -> PredictedStar:
+    return PredictedStar(
+        trial_idx=1, tpt=tpt,
+        screen_xy=(float(frame_xy[0]), float(frame_xy[1])),
+        frame_xy=frame_xy, age_s=1.0,
+        expected_radius_px=expected_radius_px,
+    )
+
+
+def test_constellation_empty_predictions():
+    """No predictions → no detections, no unmatched."""
+    dets, unmatched = detect_constellation(_blue_frame(), [])
+    assert dets == [] and unmatched == []
+
+
+def test_constellation_isolated_windows_match_detect_in_windows():
+    """Non-overlapping windows + one blob each → same result as detect_in_windows.
+
+    Verifies the unified union-and-components path produces the same answer as
+    legacy per-window detection in the singleton group case.
+    """
+    frame = _blue_frame()
+    _paint_blob(frame, 400, 400, radius=4)
+    _paint_blob(frame, 1200, 700, radius=4)
+    preds = [_pred_full((400, 400), tpt=0),
+             _pred_full((1200, 700), tpt=1)]
+
+    legacy_dets, legacy_unmatched = detect_in_windows(
+        frame, preds, window_size_px=40,
+    )
+    new_dets, new_unmatched = detect_constellation(
+        frame, preds, window_size_px=40,
+    )
+
+    assert len(new_dets) == len(legacy_dets) == 2
+    assert new_unmatched == legacy_unmatched == []
+    # Detections come back in input-prediction order.
+    assert [d.source_prediction for d in new_dets] == preds
+    for d_new, d_legacy in zip(new_dets, legacy_dets):
+        np.testing.assert_allclose(
+            d_new.frame_xy_subpix, d_legacy.frame_xy_subpix, atol=0.01,
+        )
+        assert d_new.equivalent_radius_px == pytest.approx(
+            d_legacy.equivalent_radius_px,
+        )
+
+
+def test_constellation_overlap_one_blob_assigns_to_nearer_prediction():
+    """Two overlapping windows hitting a single blob → nearer prediction wins,
+    the other is unmatched. The legacy detect_in_windows would have produced
+    two detections snapped to the same peak."""
+    frame = _blue_frame()
+    _paint_blob(frame, 800, 600, radius=4)
+    # Both windows (40 px) cover (800, 600); pred_near is 5 px away, pred_far 15.
+    pred_near = _pred_full((805, 600), tpt=0)
+    pred_far = _pred_full((815, 600), tpt=1)
+
+    dets, unmatched = detect_constellation(
+        frame, [pred_near, pred_far], window_size_px=40,
+    )
+    assert len(dets) == 1
+    assert dets[0].source_prediction is pred_near
+    assert unmatched == [pred_far]
+
+
+def test_constellation_overlap_two_blobs_each_to_own_prediction():
+    """Overlapping windows with two distinct blobs → each prediction is bound
+    to its own blob (no same-blob snapping)."""
+    frame = _blue_frame()
+    _paint_blob(frame, 800, 600, radius=3)
+    _paint_blob(frame, 820, 600, radius=3)
+    pred_a = _pred_full((800, 600), tpt=0)
+    pred_b = _pred_full((820, 600), tpt=1)
+
+    dets, unmatched = detect_constellation(
+        frame, [pred_a, pred_b], window_size_px=40,
+    )
+    assert len(dets) == 2
+    assert unmatched == []
+    by_pred = {d.source_prediction: d for d in dets}
+    fx_a, fy_a = by_pred[pred_a].frame_xy_subpix
+    fx_b, fy_b = by_pred[pred_b].frame_xy_subpix
+    assert np.hypot(fx_a - 800, fy_a - 600) < 1.5
+    assert np.hypot(fx_b - 820, fy_b - 600) < 1.5
+
+
+def test_constellation_three_predictions_two_blobs_one_unmatched():
+    """3 mutually-overlapping windows, only 2 blobs in the union →
+    exactly one prediction is unmatched (the one with no candidate blob in
+    range)."""
+    frame = _blue_frame()
+    _paint_blob(frame, 800, 600, radius=3)
+    _paint_blob(frame, 830, 600, radius=3)
+    p1 = _pred_full((800, 600), tpt=0)
+    p2 = _pred_full((815, 600), tpt=1)
+    p3 = _pred_full((830, 600), tpt=2)
+
+    dets, unmatched = detect_constellation(
+        frame, [p1, p2, p3], window_size_px=40,
+    )
+    assert len(dets) == 2
+    assert len(unmatched) == 1
+    matched_preds = {d.source_prediction for d in dets}
+    # The blobs are at the positions of p1 and p3, so they take p1 and p3;
+    # p2 (with no blob at its centroid) ends up unmatched.
+    assert matched_preds == {p1, p3}
+    assert unmatched == [p2]
+
+
+def test_constellation_blob_outside_all_windows_ignored():
+    """A blob whose centroid is not inside any prediction's window has no
+    candidate to assign to — it's silently dropped (no crash, predictions
+    around it remain unmatched)."""
+    frame = _blue_frame()
+    # Blob at (800, 600). Predictions sit far away — windows don't contain it.
+    _paint_blob(frame, 800, 600, radius=3)
+    pred_far = _pred_full((400, 400), tpt=0)
+    dets, unmatched = detect_constellation(
+        frame, [pred_far], window_size_px=40,
+    )
+    assert dets == []
+    assert unmatched == [pred_far]
+
+
+def test_constellation_rejects_oversized_blob_via_max_radius_factor():
+    """A blob whose equivalent radius is >> the prediction's expected radius
+    is rejected; the prediction is left unmatched (no fallback to a smaller
+    blob)."""
+    frame = _blue_frame()
+    _paint_blob(frame, 800, 600, radius=20)  # huge blob
+    # Expected radius 3 → max accepted (factor=4) = 12; blob's r ≈ 20.
+    pred = _pred_full((800, 600), tpt=0, expected_radius_px=3.0)
+    dets, unmatched = detect_constellation(
+        frame, [pred], window_size_px=80, max_radius_factor=4.0,
+    )
+    assert dets == []
+    assert unmatched == [pred]
+
+
+def test_constellation_off_frame_prediction_is_unmatched():
+    """A prediction whose window is fully off-frame is reported as unmatched
+    (no detection attempted)."""
+    frame = _blue_frame()
+    pred_off = _pred_full((-100, -100), tpt=0)
+    pred_on = _pred_full((400, 400), tpt=1)
+    _paint_blob(frame, 400, 400, radius=4)
+    dets, unmatched = detect_constellation(
+        frame, [pred_off, pred_on], window_size_px=40,
+    )
+    assert [d.source_prediction for d in dets] == [pred_on]
+    assert unmatched == [pred_off]
+
+
+def test_constellation_resolves_overlap_that_legacy_could_not():
+    """Direct contrast with detect_in_windows: same overlapping setup, but
+    constellation_match returns one detection (correctly), while the legacy
+    detector returns two duplicate detections at the same peak."""
+    frame = _blue_frame()
+    _paint_blob(frame, 800, 600, radius=4)
+    pred_a = _pred_full((795, 605), tpt=0)
+    pred_b = _pred_full((805, 595), tpt=1)
+
+    legacy_dets, _ = detect_in_windows(
+        frame, [pred_a, pred_b], window_size_px=40,
+    )
+    assert len(legacy_dets) == 2  # legacy: same-blob duplicates
+    assert legacy_dets[0].peak_xy == legacy_dets[1].peak_xy
+
+    new_dets, new_unmatched = detect_constellation(
+        frame, [pred_a, pred_b], window_size_px=40,
+    )
+    assert len(new_dets) == 1
+    assert len(new_unmatched) == 1
+
+
+def test_constellation_processes_blobs_in_descending_confidence_order():
+    """The brighter blob is greedily assigned first. When two blobs both
+    overlap one prediction's window but only one is also in the other
+    prediction's window, the brighter blob must claim the shared prediction;
+    otherwise the dim blob would take it and the bright blob would be
+    pushed to a much worse match (or no match at all).
+
+    Setup: p1 at (800, 600), p2 at (820, 600), windows 40 px.
+      Bright blob at (819, 600) — inside *both* windows. Wants p2 (dist 1).
+      Dim blob at (826, 600) — outside p1's window (x = 826 ≥ 820),
+        inside p2's. Its only option is p2.
+
+    Descending: bright → p2; dim then has no unspent candidate → 1 detection.
+    Ascending: dim → p2; bright then falls back to p1 at distance 19 →
+      2 detections, but bright is matched to the *wrong* prediction.
+
+    The spec's "descending confidence" gives the first outcome; this test
+    pins it.
+    """
+    frame = _blue_frame()
+    _paint_blob(frame, 819, 600, radius=2)  # bright (redness 60)
+    _paint_blob(frame, 826, 600, radius=2, color=(120, 145, 150))  # redness 30
+    p1 = _pred_full((800, 600), tpt=0)
+    p2 = _pred_full((820, 600), tpt=1)
+
+    dets, unmatched = detect_constellation(
+        frame, [p1, p2], window_size_px=40,
+    )
+    assert len(dets) == 1
+    assert dets[0].source_prediction is p2
+    assert dets[0].confidence == pytest.approx(60.0)  # bright blob, not dim
+    assert unmatched == [p1]
+
+
+def test_constellation_adaptive_window_falls_back_to_per_window():
+    """With small adaptive windows, predictions far enough apart don't
+    overlap; the matcher reduces to independent per-window detection."""
+    frame = _blue_frame()
+    _paint_blob(frame, 800, 600, radius=2)
+    _paint_blob(frame, 900, 600, radius=2)
+    preds = [_pred_full((800, 600), tpt=0, expected_radius_px=2.0),
+             _pred_full((900, 600), tpt=1, expected_radius_px=2.0)]
+    dets, unmatched = detect_constellation(
+        frame, preds, adaptive_radius_factor=4.0,
+        min_window_px=8, max_window_px=40,
+    )
+    assert len(dets) == 2
+    assert unmatched == []
+    by_pred = {d.source_prediction: d for d in dets}
+    for pred, (cx, cy) in zip(preds, [(800, 600), (900, 600)]):
+        fx, fy = by_pred[pred].frame_xy_subpix
+        assert np.hypot(fx - cx, fy - cy) < 1.5

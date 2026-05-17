@@ -11,13 +11,18 @@
   - **Step 1 — weighted re-solver + `Correspondence` dataclass**
     (`src/homography_refinement.py`). `solve_weighted_homography` uses the
     repeated-points trick for weighting (default K=10, weight 0.1
-    granularity), RANSAC at `ransacReprojThreshold=3.0` when there are ≥6
-    positive-weight correspondences, least-squares otherwise. Returns
-    `SolveResult(H, inlier_mask, residuals_px, method)` with masks/residuals
-    aligned to the *input* list (zero-weight entries → False / NaN).
-    Tests: `tests/test_homography_refinement.py` covers clean recovery,
-    least-squares path, RANSAC outlier rejection, weight-biasing, <4-point
-    rejection, zero-weight handling.
+    granularity). **Defaults to least-squares (`method=0`)**; RANSAC is
+    opt-in via `use_ransac=True` with `ransac_threshold_px=3.0`. Default
+    switched from auto-RANSAC-at-N≥6 to lstsq per pre-flight check 1, which
+    showed RANSAC's 3 px inlier filter has 3–12× worse p95 than lstsq under
+    the post-gate Gaussian-noise regime (it randomly excludes clean points
+    near the threshold and lands on degenerate subsets). RANSAC remains
+    available as a watchlist for frames where a bad correspondence survives
+    the gates. Returns `SolveResult(H, inlier_mask, residuals_px, method)`
+    with masks/residuals aligned to the *input* list (zero-weight entries →
+    False / NaN). Tests: `tests/test_homography_refinement.py` covers clean
+    recovery (lstsq), least-squares path, RANSAC outlier rejection (opt-in),
+    weight-biasing, <4-point rejection, zero-weight handling.
   - **Step 2 — detection quality gates** (`src/homography_refinement.py`).
     Three new symbols: `radius_match_ok(det, *, tau_radius=1.5)` —
     relative-error gate `|obs−exp|/exp ≤ τ` (matches Change-1's downweight
@@ -31,12 +36,23 @@
     with reasons `"radius_mismatch"` / `"same_blob"`. Tests cover both gates
     individually and end-to-end (22/22 passing in the file; 102/102 across
     the project).
-- **Where to resume:** Step 3 — greedy constellation matcher for the
-  overlapping-window case (independent per-window detection when windows
-  don't overlap; greedy assign in descending confidence to nearest
-  prediction within window radius when they do). Then correspondence-builder
-  using the Change-1 weighting table (Step 4), and `iterate_homography()`
-  controller (Step 5).
+  - **Step 3 — greedy constellation matcher** (`src/homography_refinement.py`).
+    New entry point `detect_constellation(frame, predictions, ...)` — a drop-in
+    replacement for `local_star_detector.detect_in_windows` that fixes the
+    same-blob duplicate-detection failure: predictions whose windows overlap
+    are grouped (single-link on rectangle intersection), the union mask is
+    connected-component-labelled at the same R−B floor as the per-window
+    detector, and components are greedy-assigned in *descending confidence*
+    order to the nearest unspent prediction whose rectangular window
+    contains the component centroid. The `max_radius_factor` reject still
+    fires post-assignment (and leaves the prediction unmatched, no fallback
+    blob). Singleton groups go through the same path — a minor refinement
+    over `detect_in_windows`, which averaged multi-component centroids.
+    Tests: 11 new (`test_homography_refinement.py::test_constellation_*`),
+    including a confidence-ordering pin verified by flipping the sort
+    direction. 113/113 across the project.
+- **Where to resume:** Step 4 — correspondence-builder using the Change-1
+  weighting table. Then `iterate_homography()` controller (Step 5).
 
 ## Goal (recap)
 
@@ -315,8 +331,9 @@ iterations and which detections get added/rejected.
   > 10 px` → fall back to smoothed for that corner) handles this. Watch
   reprojection error on BR specifically.
 - **Iteration could diverge if a bad detection slips through the quality
-  gates.** Plausible mitigations: RANSAC in the re-solver (now in plan),
-  and discarding any iteration whose H moves the bottom corners > 5 px from
+  gates.** Plausible mitigations: opt-in RANSAC in the re-solver
+  (`use_ransac=True`, available but off by default per Change 1), and
+  discarding any iteration whose H moves the bottom corners > 5 px from
   the smoothed value.
 - **Configurations where iteration "works" but answer is wrong.** Same-blob
   snapping at iteration 0 could produce 7 "detections" all on the same

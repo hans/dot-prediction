@@ -30,9 +30,19 @@ import cv2
 import numpy as np
 
 try:
-    from local_star_detector import LocalDetection
+    from local_star_detector import (
+        LocalDetection,
+        _window_bounds,
+        _window_size_for,
+    )
+    from predicted_positions import PredictedStar
 except ImportError:
-    from src.local_star_detector import LocalDetection
+    from src.local_star_detector import (
+        LocalDetection,
+        _window_bounds,
+        _window_size_for,
+    )
+    from src.predicted_positions import PredictedStar
 
 CorrespondenceSource = Literal[
     "corner_smoothed",
@@ -123,34 +133,33 @@ def _project_many(H: np.ndarray, screen_xy: np.ndarray) -> np.ndarray:
 def solve_weighted_homography(
     correspondences: list[Correspondence],
     *,
-    ransac_threshold_px: float = 3.0,
     weight_replication: int = 10,
-    ransac_min_correspondences: int = 6,
+    use_ransac: bool = False,
+    ransac_threshold_px: float = 3.0,
 ) -> SolveResult:
     """Solve for screen→frame H from a weighted correspondence set.
 
     Weights are realised via the **repeated-points trick**: each correspondence
     contributes ``max(1, round(weight × weight_replication))`` rows to the DLT
-    system. Stock ``cv2.findHomography`` then weights duplicates equally,
-    which (for RANSAC) gives high-trust points proportionally more inlier
-    voting power. This is the spec's "simple first cut"; a hand-rolled
-    weighted DLT can replace it later if continuous weights matter.
+    system. This is the spec's "simple first cut"; a hand-rolled weighted DLT
+    can replace it later if continuous weights matter.
 
-    RANSAC is used when there are at least ``ransac_min_correspondences``
-    unique correspondences (enough degrees of freedom to drop an outlier);
-    below that, least-squares is used and the inlier mask is all-True.
+    Least-squares (``method=0``) is the default. Pre-flight check 1 shows
+    that under pure Gaussian noise — the expected post-gate regime — lstsq
+    has 3–12× lower p95 error than RANSAC at σ≥1 px. Set ``use_ransac=True``
+    only if eval surfaces correspondences that survived the quality gates and
+    destabilised H (see spec Risk section).
 
     Args:
         correspondences: Non-empty list of ``Correspondence``. Entries with
             ``weight <= 0`` are silently dropped.
-        ransac_threshold_px: Frame-pixel reprojection threshold passed to
-            ``cv2.findHomography(..., method=cv2.RANSAC)``. Defaults to 3.0
-            per spec.
         weight_replication: Multiplier converting continuous weights into
             integer row replication counts (default 10 → weights of 0.1
             granularity).
-        ransac_min_correspondences: Minimum unique correspondences before
-            switching from least-squares to RANSAC.
+        use_ransac: If True, use ``cv2.RANSAC`` with ``ransac_threshold_px``.
+            Default False (lstsq).
+        ransac_threshold_px: Frame-pixel reprojection threshold for RANSAC.
+            Ignored when ``use_ransac=False``.
 
     Returns:
         ``SolveResult`` with H, inlier mask aligned to the input list, and
@@ -182,7 +191,6 @@ def solve_weighted_homography(
     src = np.asarray(repeated_screen, dtype=np.float64)
     dst = np.asarray(repeated_frame, dtype=np.float64)
 
-    use_ransac = len(usable) >= ransac_min_correspondences
     if use_ransac:
         H, mask = cv2.findHomography(
             src.astype(np.float32),
@@ -405,3 +413,224 @@ def apply_quality_gates(
     )
     rejections.extend(GateRejection(d, "same_blob") for d in blob_rejected)
     return accepted, rejections
+
+
+# ---------------------------------------------------------------------------
+# Greedy constellation matcher (Phase 1c Step 3)
+# ---------------------------------------------------------------------------
+
+
+def _group_overlapping_windows(
+    bounds: list[tuple[int, int, int, int]],
+) -> list[list[int]]:
+    """Single-link cluster of axis-aligned window rects by overlap."""
+    n = len(bounds)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(n):
+        x0i, y0i, x1i, y1i = bounds[i]
+        for j in range(i + 1, n):
+            x0j, y0j, x1j, y1j = bounds[j]
+            if x0i < x1j and x0j < x1i and y0i < y1j and y0j < y1i:
+                union(i, j)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
+
+
+def _greedy_assign_in_union(
+    redness: np.ndarray,
+    group_preds: list[PredictedStar],
+    group_bounds: list[tuple[int, int, int, int]],
+    *,
+    floor: float,
+    max_radius_factor: float,
+) -> tuple[list[LocalDetection], list[PredictedStar]]:
+    """Find connected components in the union of windows, greedy-assign.
+
+    Each component becomes a candidate blob; in descending-confidence order
+    the blob is bound to the nearest unspent prediction (by centroid distance
+    to ``prediction.frame_xy``) whose rectangular window contains the blob's
+    centroid. A blob too large under the assigned prediction's radius model
+    (``equivalent_radius > max_radius_factor × expected``) is rejected; the
+    prediction is then left unmatched and no fallback blob is tried.
+    """
+    ux0 = min(b[0] for b in group_bounds)
+    uy0 = min(b[1] for b in group_bounds)
+    ux1 = max(b[2] for b in group_bounds)
+    uy1 = max(b[3] for b in group_bounds)
+
+    redness_crop = redness[uy0:uy1, ux0:ux1]
+    h_c, w_c = redness_crop.shape
+    in_union = np.zeros((h_c, w_c), dtype=bool)
+    for x0, y0, x1, y1 in group_bounds:
+        in_union[y0 - uy0:y1 - uy0, x0 - ux0:x1 - ux0] = True
+
+    mask = ((redness_crop > floor) & in_union).astype(np.uint8)
+    n_labels, labels = cv2.connectedComponents(mask, connectivity=8)
+
+    blobs: list[tuple[float, float, float, int, int, float]] = []
+    for lbl in range(1, n_labels):
+        ys, xs = np.nonzero(labels == lbl)
+        weights = redness_crop[ys, xs]
+        total = weights.sum()
+        cx_local = float((xs * weights).sum() / total)
+        cy_local = float((ys * weights).sum() / total)
+        peak_idx = int(np.argmax(weights))
+        confidence = float(weights[peak_idx])
+        radius = float(np.sqrt(len(xs) / np.pi))
+        blobs.append((
+            confidence,
+            ux0 + cx_local,
+            uy0 + cy_local,
+            ux0 + int(xs[peak_idx]),
+            uy0 + int(ys[peak_idx]),
+            radius,
+        ))
+
+    blobs.sort(key=lambda b: b[0], reverse=True)
+
+    spent: set[int] = set()
+    matched: dict[int, LocalDetection] = {}
+    for confidence, cx, cy, peak_x, peak_y, radius in blobs:
+        candidates: list[tuple[float, int]] = []
+        for i, (x0, y0, x1, y1) in enumerate(group_bounds):
+            if i in spent:
+                continue
+            if x0 <= cx < x1 and y0 <= cy < y1:
+                px, py = group_preds[i].frame_xy
+                candidates.append(((px - cx) ** 2 + (py - cy) ** 2, i))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda t: t[0])
+        _, idx = candidates[0]
+        spent.add(idx)
+        pred = group_preds[idx]
+        if (
+            pred.expected_radius_px > 0
+            and radius > max_radius_factor * pred.expected_radius_px
+        ):
+            continue
+        matched[idx] = LocalDetection(
+            frame_xy_subpix=(cx, cy),
+            confidence=confidence,
+            equivalent_radius_px=radius,
+            peak_xy=(peak_x, peak_y),
+            source_prediction=pred,
+        )
+
+    detections = [matched[i] for i in range(len(group_preds)) if i in matched]
+    unmatched = [p for i, p in enumerate(group_preds) if i not in matched]
+    return detections, unmatched
+
+
+def detect_constellation(
+    frame: np.ndarray,
+    predictions: list[PredictedStar],
+    *,
+    window_size_px: int = 40,
+    floor: float = 20.0,
+    max_radius_factor: float = 4.0,
+    adaptive_radius_factor: float | None = None,
+    min_window_px: int = 10,
+    max_window_px: int = 60,
+) -> tuple[list[LocalDetection], list[PredictedStar]]:
+    """Position-conditioned local detection with greedy constellation matching.
+
+    Drop-in replacement for ``local_star_detector.detect_in_windows`` that
+    handles overlapping search windows: when two or more predictions' windows
+    overlap, blobs in the union are extracted as connected components and
+    greedy-assigned to predictions in descending-confidence order (each blob
+    to the nearest unspent prediction whose window contains it).
+
+    Compared to ``detect_in_windows`` this fixes the per-frame failure mode
+    where N predictions snap to the same shared blob (one detection per
+    prediction, all on the same peak). Independently it also fixes the rare
+    case where a single non-overlapping window contains two distinct above-
+    floor components — ``detect_in_windows`` averages their centroids; this
+    function picks the highest-confidence component.
+
+    Same-blob conflicts are now prevented at the source, but
+    ``resolve_blob_conflicts`` is still useful downstream as a safety net for
+    distinct blobs whose centroids happen to land within ``τ_centroid_px`` of
+    each other across different overlap groups.
+
+    Args:
+        frame: BGR uint8 image, shape (H, W, 3).
+        predictions: List of ``PredictedStar`` from ``predicted_positions``.
+        window_size_px: Fixed square window side length (px), used when
+            ``adaptive_radius_factor`` is None.
+        floor: Minimum R−B opponent-channel value for a pixel to count as
+            part of a blob.
+        max_radius_factor: A blob is rejected after assignment when its
+            equivalent radius exceeds this × the assigned prediction's
+            ``expected_radius_px``. The prediction is then left unmatched
+            (no fallback to a smaller blob in the same union).
+        adaptive_radius_factor: When set, each prediction's window is
+            ``factor × expected_radius_px`` clipped to
+            ``[min_window_px, max_window_px]``.
+        min_window_px: Lower clip on adaptive window size.
+        max_window_px: Upper clip on adaptive window size.
+
+    Returns:
+        ``(detections, unmatched)`` partitioning ``predictions``: detections
+        are in input-prediction order; off-frame and unmatched predictions
+        accumulate in ``unmatched`` (also in input order). A prediction whose
+        window is fully off-frame is reported as unmatched without any
+        detection attempt.
+    """
+    if not predictions:
+        return [], []
+
+    h_img, w_img = frame.shape[:2]
+    redness = (
+        frame[:, :, 2].astype(np.float32) - frame[:, :, 0].astype(np.float32)
+    )
+
+    on_frame_bounds: list[tuple[int, int, int, int]] = []
+    on_frame_preds: list[PredictedStar] = []
+    off_frame_preds: list[PredictedStar] = []
+    for pred in predictions:
+        cx, cy = pred.frame_xy
+        win = _window_size_for(
+            pred, window_size_px, adaptive_radius_factor,
+            min_window_px, max_window_px,
+        )
+        b = _window_bounds(cx, cy, win, w_img, h_img)
+        if b is None:
+            off_frame_preds.append(pred)
+        else:
+            on_frame_preds.append(pred)
+            on_frame_bounds.append(b)
+
+    groups = _group_overlapping_windows(on_frame_bounds)
+
+    detections: list[LocalDetection] = []
+    unmatched: list[PredictedStar] = list(off_frame_preds)
+    for group in groups:
+        group_preds = [on_frame_preds[i] for i in group]
+        group_bounds = [on_frame_bounds[i] for i in group]
+        d, u = _greedy_assign_in_union(
+            redness, group_preds, group_bounds,
+            floor=floor, max_radius_factor=max_radius_factor,
+        )
+        detections.extend(d)
+        unmatched.extend(u)
+
+    order = {id(p): i for i, p in enumerate(predictions)}
+    detections.sort(key=lambda d: order[id(d.source_prediction)])
+    unmatched.sort(key=lambda p: order[id(p)])
+    return detections, unmatched
