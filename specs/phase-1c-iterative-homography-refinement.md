@@ -4,13 +4,25 @@
 
 - **Branch:** `iterative-homography-refi` (worktree:
   `/Users/jon/.superset/worktrees/8cf2b0ca-f274-4f35-82b2-46edc185b2f7/iterative-homography-refi/`).
-- **What's been done:** pre-flight checks (the 3 spec-listed sanity checks).
-  Results below — they change the design in 3 material ways. No production
-  code committed yet.
-- **Where to resume:** implementation of the iteration controller, quality
-  gates, and re-solver, per the **updated** design in the "Design" section
-  below. Pre-flight script lives at `scripts/preflight_phase1c.py`; results
-  at `results/EC347/preflight_phase1c/`.
+- **What's been done:**
+  - Pre-flight checks (3 sanity checks). Results below — they change the
+    design in 3 material ways. Script: `scripts/preflight_phase1c.py`;
+    outputs: `results/EC347/preflight_phase1c/`.
+  - **Step 1 — weighted re-solver + `Correspondence` dataclass**
+    (`src/homography_refinement.py`). `solve_weighted_homography` uses the
+    repeated-points trick for weighting (default K=10, weight 0.1
+    granularity), RANSAC at `ransacReprojThreshold=3.0` when there are ≥6
+    positive-weight correspondences, least-squares otherwise. Returns
+    `SolveResult(H, inlier_mask, residuals_px, method)` with masks/residuals
+    aligned to the *input* list (zero-weight entries → False / NaN).
+    Tests: `tests/test_homography_refinement.py` covers clean recovery,
+    least-squares path, RANSAC outlier rejection, weight-biasing, <4-point
+    rejection, zero-weight handling (10/10 passing).
+- **Where to resume:** Step 2 — detection quality gates (centroid
+  distinctness τ=3 px, equivalent-radius match τ=1.5, conflict resolver for
+  same-blob snapping) per the "Quality gates" section. Then greedy
+  constellation matcher (Step 3), correspondence-builder using the Change-1
+  weighting table (Step 4), and `iterate_homography()` controller (Step 5).
 
 ## Goal (recap)
 
