@@ -91,6 +91,15 @@
   and writes `results/EC347/iterative_homography_eval/iterative_homography_eval.csv` plus
   per-frame JPEG overlays (v4_f*_iters.jpg). Evaluate against the "What success looks like"
   criteria before deciding on Phase 1d next steps.
+- **Deferred — additional eval frames:** Two interactive scouting notebooks exist in
+  `notebooks/` to find the 2–3 extra frames the Evaluation section calls for. Run these
+  manually and pick candidates before finalising the eval frame set:
+  - `notebooks/scout_corner_glare.ipynb` — full-video corner scan; finds frames where
+    |raw − smoothed| for BR (or any corner) exceeds a threshold. Target: one frame with
+    significant BR glare so the pre-iteration perspective residual is large.
+  - `notebooks/scout_anchor_position.ipynb` — scans all trial reveal frames; ranks them
+    by how close the big star's screen position is to a screen corner. Target: one frame
+    where the anchor is corner-proximate so most small stars are far from the anchor.
 
 ## Goal (recap)
 
