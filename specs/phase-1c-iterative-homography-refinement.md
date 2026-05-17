@@ -84,7 +84,13 @@
     `base × expected_radius` only. 14 new tests cover all 5 termination paths, both
     anchor states, step field completeness, H-projection accuracy, and
     correspondence fallback. 142/142 across the project.
-- **Where to resume:** Step 6 — `notebooks/iterative_homography_eval.py` evaluation notebook.
+- **Where to resume:** Run `notebooks/iterative_homography_eval.py` (Viz 4+) on real EC347
+  data and review the per-iteration detection-rate, distance-from-anchor, same-blob-snapping,
+  and reprojection-error outputs. Steps 1–5 are fully implemented (142/142 tests pass).
+  The notebook's Viz 4 section calls `iterate_homography` on the 7 Phase-1b eval frames
+  and writes `results/EC347/iterative_homography_eval/iterative_homography_eval.csv` plus
+  per-frame JPEG overlays (v4_f*_iters.jpg). Evaluate against the "What success looks like"
+  criteria before deciding on Phase 1d next steps.
 
 ## Goal (recap)
 
@@ -392,6 +398,41 @@ iterations and which detections get added/rejected.
 
 If we hit this, downstream homography solving is essentially trivial —
 `H_refined` *is* the homography we want.
+
+## Alternatives considered: CNN-based star detection
+
+Raised ~2 days into Phase 1c implementation: should we abandon the classical
+pipeline (constellation matcher + correspondence builder + RANSAC sweep + DLT
+solve) and train a CNN to pick out the stars instead? Conclusion: **no, not
+yet — validate the current pipeline end-to-end first.**
+
+Three plausible CNN framings, and why each is more expensive than finishing
+the current pipeline:
+
+| Framing | What it replaces | What it doesn't replace | Why it's not cheaper |
+|---|---|---|---|
+| **Detector only** (CNN outputs star pixel locations) | Blob detection | Correspondence assignment, homography solve | Detection isn't the bottleneck — Phase 1b already detects bright point sources. Recent commits (constellation matcher, correspondence builder, RANSAC sweep, weighted lstsq) are all about correspondence + robust solve. A CNN here doesn't touch the actual hard parts. |
+| **Detector + identity** (CNN outputs "this is star #7") | Blob detection + greedy constellation matcher | Homography solve | Labels per star are at least tractable since the constellation is part of our design, but still need hundreds of frames labeled across lighting/angle conditions. Cheaper than end-to-end but more expensive than running the current matcher on real frames. |
+| **End-to-end homography regression** (CNN outputs H) | Entire pipeline | — | Data-hungry, brittle outside the training distribution, requires synthetic-data + domain-randomization infrastructure to be viable. Not 2 days of work. |
+
+The hard pieces of this phase (correspondence + robust solve) are the parts a
+CNN-detector would still hand back to us, and the parts that would need their
+own training labels even in a CNN-matcher framing. The current pipeline at
+Step 5 has 142/142 tests passing; the unresolved question is whether it
+produces a stable, accurate `H_refined` on real EC347 frames — which we can
+test in the existing notebook in hours, not weeks.
+
+**Decision:** Validate the current pipeline on real video (run
+`notebooks/iterative_homography_eval.py` Viz 4+ on the 7 Phase-1b eval
+frames; review against "What success looks like"). If the pipeline works
+on even one frame with reasonable accuracy, ship it. If it's hopeless, the
+failure mode tells us whether a CNN would actually help — detection failures
+(probably not, fix the detector), correspondence failures (maybe, but a
+labeled matcher is cheaper than a CNN), or geometry failures (no, CNN won't
+save us).
+
+Revisit this decision only if eval shows systemic failure that maps to a
+specific CNN framing's strength.
 
 ---
 
