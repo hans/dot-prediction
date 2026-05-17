@@ -9,6 +9,7 @@ from src.homography_refinement import (
     GateRejection,
     anchor_translate,
     apply_quality_gates,
+    build_correspondences,
     detect_constellation,
     radius_match_ok,
     resolve_blob_conflicts,
@@ -643,3 +644,242 @@ def test_constellation_adaptive_window_falls_back_to_per_window():
     for pred, (cx, cy) in zip(preds, [(800, 600), (900, 600)]):
         fx, fy = by_pred[pred].frame_xy_subpix
         assert np.hypot(fx - cx, fy - cy) < 1.5
+
+
+# ---------------------------------------------------------------------------
+# Correspondence builder (Phase 1c Step 4)
+# ---------------------------------------------------------------------------
+
+# Fixed iPad screen corners [TL, TR, BR, BL] used across tests.
+_SCREEN_CORNERS = np.array([
+    [0.0, 0.0],       # TL
+    [2388.0, 0.0],    # TR
+    [2388.0, 1668.0], # BR
+    [0.0, 1668.0],    # BL
+], dtype=np.float64)
+
+# A plausible smoothed-corner array in frame coords.
+_SMOOTHED = np.array([
+    [100.0, 80.0],   # TL
+    [900.0, 75.0],   # TR
+    [910.0, 700.0],  # BR
+    [95.0, 710.0],   # BL
+], dtype=np.float64)
+
+
+def _raw(offsets: tuple[tuple, tuple, tuple, tuple]) -> np.ndarray:
+    """Build a raw-corners array by adding per-corner (dx, dy) to _SMOOTHED."""
+    arr = _SMOOTHED.copy()
+    for i, (dx, dy) in enumerate(offsets):
+        arr[i, 0] += dx
+        arr[i, 1] += dy
+    return arr
+
+
+def _sources(corrs):
+    return [c.source for c in corrs]
+
+
+# --- Corner-only cases -------------------------------------------------------
+
+def test_build_correspondences_no_raw_corners_includes_only_smoothed_bottom():
+    """When raw_corners is None, only the two smoothed BL/BR correspondences
+    appear — no top corners, no raw-corner entries."""
+    corrs = build_correspondences(_SMOOTHED, _SCREEN_CORNERS)
+    # BL (idx 3) and BR (idx 2), both smoothed.
+    assert len(corrs) == 2
+    assert all(c.source == "corner_smoothed" for c in corrs)
+    assert all(c.weight == pytest.approx(1.0) for c in corrs)
+    # Screen coordinates must match the BL/BR slots.
+    screen_xys = {c.screen_xy for c in corrs}
+    assert (0.0, 1668.0) in screen_xys   # BL
+    assert (2388.0, 1668.0) in screen_xys # BR
+
+
+def test_build_correspondences_raw_bl_br_close_adds_raw_correspondences():
+    """Raw BL/BR within threshold → also appear at weight 0.5."""
+    raw = _raw(((0, 0), (0, 0), (3.0, 0), (3.0, 0)))  # BL/BR shifted 3 px (< 10)
+    corrs = build_correspondences(_SMOOTHED, _SCREEN_CORNERS, raw_corners=raw)
+    # 2 smoothed bottom + 2 raw bottom = 4; top corners excluded because raw
+    # TL/TR delta is 0 px which IS < 5 px, so smoothed+raw TL+TR = 4 more.
+    # (3 px < 5 px threshold for TL/TR)
+    bottom_smooth = [c for c in corrs
+                     if c.source == "corner_smoothed" and c.weight == pytest.approx(1.0)]
+    bottom_raw = [c for c in corrs
+                  if c.source == "corner_raw" and c.weight == pytest.approx(0.5)]
+    assert len(bottom_smooth) == 2
+    assert len(bottom_raw) == 2
+    # Frame xy of the raw entries should differ from smoothed by the offset.
+    raw_bl = next(c for c in bottom_raw if c.screen_xy == (0.0, 1668.0))
+    assert raw_bl.frame_xy[0] == pytest.approx(_SMOOTHED[3, 0] + 3.0)
+
+
+def test_build_correspondences_raw_bl_br_at_threshold_excluded():
+    """Delta exactly at raw_bl_br_tau_px (10.0) is NOT included (< not ≤)."""
+    raw = _raw(((0, 0), (0, 0), (0, 10.0), (0, 10.0)))  # delta = 10.0 px
+    corrs = build_correspondences(_SMOOTHED, _SCREEN_CORNERS, raw_corners=raw)
+    raw_bottom = [c for c in corrs if c.source == "corner_raw"
+                  and c.weight == pytest.approx(0.5)]
+    assert raw_bottom == []
+
+
+def test_build_correspondences_raw_bl_br_far_excluded():
+    """Raw BL/BR >10 px from smoothed → not added; smoothed still at 1.0."""
+    raw = _raw(((0, 0), (0, 0), (15.0, 0), (-20.0, 0)))  # BL/BR > 10 px
+    corrs = build_correspondences(_SMOOTHED, _SCREEN_CORNERS, raw_corners=raw)
+    raw_bottom = [c for c in corrs if c.source == "corner_raw"
+                  and c.weight == pytest.approx(0.5)]
+    assert raw_bottom == []
+    smooth_bottom = [c for c in corrs if c.source == "corner_smoothed"
+                     and c.weight == pytest.approx(1.0)]
+    assert len(smooth_bottom) == 2
+
+
+def test_build_correspondences_top_corners_included_when_raw_close():
+    """Raw TL/TR within raw_tl_tr_tau_px → smoothed at 0.3 and raw at 0.1 added."""
+    raw = _raw(((2.0, 0), (1.0, 0), (0, 0), (0, 0)))  # TL: 2 px, TR: 1 px (both < 5)
+    corrs = build_correspondences(_SMOOTHED, _SCREEN_CORNERS, raw_corners=raw)
+    top_smooth = [c for c in corrs if c.source == "corner_smoothed"
+                  and c.weight == pytest.approx(0.3)]
+    top_raw = [c for c in corrs if c.source == "corner_raw"
+               and c.weight == pytest.approx(0.1)]
+    assert len(top_smooth) == 2  # TL and TR
+    assert len(top_raw) == 2
+
+
+def test_build_correspondences_top_corners_at_threshold_excluded():
+    """Delta exactly 5.0 px for a top corner → that corner is excluded."""
+    raw = _raw(((5.0, 0), (1.0, 0), (0, 0), (0, 0)))  # TL=5 px (not < 5), TR=1 px
+    corrs = build_correspondences(_SMOOTHED, _SCREEN_CORNERS, raw_corners=raw)
+    # TR included (1 < 5), TL excluded.
+    tl_screen = (0.0, 0.0)
+    tr_screen = (2388.0, 0.0)
+    tl_corrs = [c for c in corrs if c.screen_xy == tl_screen]
+    tr_corrs = [c for c in corrs if c.screen_xy == tr_screen]
+    assert tl_corrs == []
+    assert len(tr_corrs) == 2  # smoothed 0.3 + raw 0.1
+
+
+def test_build_correspondences_top_corners_excluded_when_raw_far():
+    """Raw TL/TR many pixels from smoothed → both omitted from output."""
+    raw = _raw(((50.0, 0), (100.0, 0), (0, 0), (0, 0)))  # TL=50 px, TR=100 px
+    corrs = build_correspondences(_SMOOTHED, _SCREEN_CORNERS, raw_corners=raw)
+    top_corrs = [c for c in corrs
+                 if c.screen_xy in {(0.0, 0.0), (2388.0, 0.0)}]
+    assert top_corrs == []
+
+
+# --- Big star ----------------------------------------------------------------
+
+def test_build_correspondences_big_star_added():
+    """Providing both big_star_* args adds one big_star correspondence at the given weight."""
+    corrs = build_correspondences(
+        _SMOOTHED, _SCREEN_CORNERS,
+        big_star_screen_xy=(1000.0, 800.0),
+        big_star_frame_xy=(450.0, 360.0),
+        big_star_weight=0.9,
+    )
+    big = [c for c in corrs if c.source == "big_star"]
+    assert len(big) == 1
+    assert big[0].screen_xy == (1000.0, 800.0)
+    assert big[0].frame_xy == (450.0, 360.0)
+    assert big[0].weight == pytest.approx(0.9)
+
+
+def test_build_correspondences_big_star_absent_when_not_provided():
+    """No big_star_screen_xy/frame_xy → no big_star entry."""
+    corrs = build_correspondences(_SMOOTHED, _SCREEN_CORNERS)
+    assert all(c.source != "big_star" for c in corrs)
+
+
+# --- Small stars -------------------------------------------------------------
+
+def test_build_correspondences_small_star_full_weight_within_blend_tau():
+    """A detection with rel_err ≤ 0.5 gets the full (normalized) confidence."""
+    pred = _pred((500.0, 400.0), (220.0, 180.0), expected_radius_px=10.0)
+    det = _det(pred, (221.0, 181.0), equivalent_radius_px=11.0,  # rel_err = 0.1
+               confidence=127.5)  # conf/255 = 0.5
+    corrs = build_correspondences(
+        _SMOOTHED, _SCREEN_CORNERS,
+        small_stars=[det],
+    )
+    small = [c for c in corrs if c.source == "small_star"]
+    assert len(small) == 1
+    assert small[0].weight == pytest.approx(0.5)  # 0.5 × 1.0
+
+
+def test_build_correspondences_small_star_blended_weight_mid_range():
+    """A detection with rel_err = 1.0 (halfway between 0.5 and 1.5) gets factor 0.75."""
+    pred = _pred((500.0, 400.0), (220.0, 180.0), expected_radius_px=10.0)
+    det = _det(pred, (221.0, 181.0), equivalent_radius_px=20.0,  # rel_err = 1.0
+               confidence=255.0)  # normalized to 1.0
+    corrs = build_correspondences(
+        _SMOOTHED, _SCREEN_CORNERS,
+        small_stars=[det],
+    )
+    small = [c for c in corrs if c.source == "small_star"]
+    # blend: t = (1.0 - 0.5) / (1.5 - 0.5) = 0.5, factor = 1.0 - 0.5*0.5 = 0.75
+    assert small[0].weight == pytest.approx(0.75)
+
+
+def test_build_correspondences_small_star_confidence_clamped_above_scale():
+    """Confidence > small_star_confidence_scale is clamped to 1.0 before weighting."""
+    pred = _pred((500.0, 400.0), (220.0, 180.0), expected_radius_px=10.0)
+    det = _det(pred, (221.0, 181.0), equivalent_radius_px=10.0,
+               confidence=300.0)  # > 255
+    corrs = build_correspondences(
+        _SMOOTHED, _SCREEN_CORNERS,
+        small_stars=[det],
+    )
+    small = [c for c in corrs if c.source == "small_star"]
+    assert small[0].weight == pytest.approx(1.0)  # clamped, rel_err=0 → factor 1.0
+
+
+def test_build_correspondences_small_star_zero_expected_radius_permissive():
+    """When expected_radius_px=0, no size model exists — treat rel_err as 0."""
+    pred = _pred((500.0, 400.0), (220.0, 180.0), expected_radius_px=0.0)
+    det = _det(pred, (221.0, 181.0), equivalent_radius_px=50.0,
+               confidence=255.0)
+    corrs = build_correspondences(
+        _SMOOTHED, _SCREEN_CORNERS,
+        small_stars=[det],
+    )
+    small = [c for c in corrs if c.source == "small_star"]
+    assert small[0].weight == pytest.approx(1.0)  # factor stays 1.0
+
+
+# --- Source-tag completeness -------------------------------------------------
+
+def test_build_correspondences_all_four_source_tags_present():
+    """A fully-populated call produces correspondences with all four source tags."""
+    raw = _raw(((1.0, 0), (1.0, 0), (1.0, 0), (1.0, 0)))  # all within thresholds
+    pred = _pred((500.0, 400.0), (220.0, 180.0), expected_radius_px=10.0)
+    det = _det(pred, (221.0, 181.0), equivalent_radius_px=10.0, confidence=200.0)
+    corrs = build_correspondences(
+        _SMOOTHED, _SCREEN_CORNERS,
+        raw_corners=raw,
+        big_star_screen_xy=(1000.0, 800.0),
+        big_star_frame_xy=(450.0, 360.0),
+        small_stars=[det],
+    )
+    sources = {c.source for c in corrs}
+    assert sources == {"corner_smoothed", "corner_raw", "big_star", "small_star"}
+
+
+# --- Integration: output feeds solve_weighted_homography --------------------
+
+def test_build_correspondences_result_feeds_solver():
+    """Output of build_correspondences can be passed directly to
+    solve_weighted_homography and produce a valid H.
+
+    Uses a corner-only scenario (no star detections) to keep the geometry
+    clean, and verifies that the row-count balance is dominated by the
+    bottom-corner correspondences (the highest-weight entries).
+    """
+    raw = _raw(((1.0, 0), (1.0, 0), (1.0, 0), (1.0, 0)))
+    corrs = build_correspondences(_SMOOTHED, _SCREEN_CORNERS, raw_corners=raw)
+    # Four smoothed bottom+top corners + four raw entries = ≥ 4 with positive weight.
+    result = solve_weighted_homography(corrs)
+    assert result.H is not None
+    assert result.H.shape == (3, 3)
+    assert result.method == "lstsq"

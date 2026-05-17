@@ -19,6 +19,9 @@ re-solve until convergence. This module provides the building blocks:
 * ``apply_quality_gates`` — radius-match + same-blob-snapping filter over
   ``LocalDetection`` outputs (with ``radius_match_ok`` and
   ``resolve_blob_conflicts`` as the per-gate helpers).
+* ``build_correspondences`` — assembles the weighted correspondence list
+  from smoothed/raw corners, a big-star anchor, and quality-gated small-
+  star detections per the Change-1 weighting table.
 """
 
 from __future__ import annotations
@@ -634,3 +637,183 @@ def detect_constellation(
     detections.sort(key=lambda d: order[id(d.source_prediction)])
     unmatched.sort(key=lambda p: order[id(p)])
     return detections, unmatched
+
+
+# ---------------------------------------------------------------------------
+# Correspondence builder (Phase 1c Step 4)
+# ---------------------------------------------------------------------------
+
+# Corner indices follow screen_detection.detect_corners: [TL, TR, BR, BL].
+_CORNER_TL, _CORNER_TR, _CORNER_BR, _CORNER_BL = 0, 1, 2, 3
+
+
+def build_correspondences(
+    smoothed_corners: np.ndarray,
+    screen_corners: np.ndarray,
+    *,
+    raw_corners: np.ndarray | None = None,
+    big_star_screen_xy: tuple[float, float] | None = None,
+    big_star_frame_xy: tuple[float, float] | None = None,
+    big_star_weight: float = 1.0,
+    small_stars: list[LocalDetection] | None = None,
+    raw_bl_br_tau_px: float = 10.0,
+    raw_tl_tr_tau_px: float = 5.0,
+    small_star_radius_blend_tau: float = 0.5,
+    small_star_tau_radius: float = 1.5,
+    small_star_confidence_scale: float = 255.0,
+) -> list[Correspondence]:
+    """Build the weighted correspondence set for the homography re-solver.
+
+    Implements the Change-1 weighting table from the Phase-1c spec:
+
+    +----------------------------+--------+----------------------------------------------+
+    | Source                     | Weight | Conditions                                   |
+    +============================+========+==============================================+
+    | Smoothed BL, BR            | 1.0    | Always included.                             |
+    +----------------------------+--------+----------------------------------------------+
+    | Raw BL, BR                 | 0.5    | |raw − smoothed| < ``raw_bl_br_tau_px``.     |
+    +----------------------------+--------+----------------------------------------------+
+    | Smoothed TL, TR            | 0.3    | |raw − smoothed| < ``raw_tl_tr_tau_px``.     |
+    +----------------------------+--------+----------------------------------------------+
+    | Raw TL, TR                 | 0.1    | |raw − smoothed| < ``raw_tl_tr_tau_px``.     |
+    +----------------------------+--------+----------------------------------------------+
+    | Big star                   | caller | Both ``big_star_*`` args provided.           |
+    +----------------------------+--------+----------------------------------------------+
+    | Small stars (quality-gated)| varies | conf / scale × radius-match factor.          |
+    +----------------------------+--------+----------------------------------------------+
+
+    Corner ordering follows ``screen_detection.detect_corners``: [TL, TR, BR, BL].
+
+    **Top-corner gating:** when ``raw_corners`` is absent (detection failed for
+    this frame), top corners are omitted entirely — their quality cannot be
+    assessed from the smoothed value alone. Bottom corners are always included at
+    weight 1.0 regardless (spec: "Always included").
+
+    **Small-star weights:** each detection's ``confidence`` (raw R−B peak value)
+    is divided by ``small_star_confidence_scale`` (default 255) to normalise to
+    [0, 1], then multiplied by a radius-match factor that is 1.0 for
+    ``rel_err ≤ small_star_radius_blend_tau`` and linearly drops to 0.5 at
+    ``small_star_tau_radius`` (matching the quality-gate cutoff).
+
+    Args:
+        smoothed_corners: (4, 2) float array [TL, TR, BR, BL] of rolling-median
+            smoothed corner positions in frame pixels. Always required.
+        screen_corners: (4, 2) float array [TL, TR, BR, BL] of corner positions
+            in iPad screen pixels (typically the four screen-edge corners).
+        raw_corners: Optional (4, 2) array of raw (unsmoothed) corner frame
+            coordinates in the same [TL, TR, BR, BL] order. When *None*, raw
+            correspondences are not added and top corners are omitted.
+        big_star_screen_xy: iPad screen-pixel position of the anchor (big) star.
+            If *None*, no big-star correspondence is added.
+        big_star_frame_xy: Detected frame-pixel position of the big star.
+        big_star_weight: Weight for the big-star correspondence (default 1.0).
+        small_stars: Quality-gated ``LocalDetection`` outputs. Pass the list
+            returned by ``apply_quality_gates``.
+        raw_bl_br_tau_px: |raw − smoothed| threshold (px) below which raw BL/BR
+            are added at weight 0.5. Detections ≥ this value are excluded
+            (default 10 px per pre-flight check 2).
+        raw_tl_tr_tau_px: |raw − smoothed| threshold (px) below which TL/TR
+            correspondences (both smoothed and raw) are included. At or above
+            this value both are dropped (default 5 px per pre-flight check 2).
+        small_star_radius_blend_tau: Relative-error threshold below which small
+            stars receive full weight (default 0.5); above this the weight is
+            linearly blended down to 0.5× at ``small_star_tau_radius``.
+        small_star_tau_radius: Upper bound of the linear blend range — should
+            match the ``tau_radius`` passed to ``apply_quality_gates`` (default
+            1.5). Detections above this would already have been filtered out by
+            the gate; the parameter exists so the blend endpoint tracks the gate
+            when both are tuned together.
+        small_star_confidence_scale: Divisor applied to each detection's raw R−B
+            confidence before weighting (default 255, the channel maximum).
+
+    Returns:
+        List of ``Correspondence`` objects ready for ``solve_weighted_homography``,
+        ordered: bottom corners → top corners → big star → small stars.
+    """
+    corrs: list[Correspondence] = []
+
+    # --- Bottom corners (BL, BR) ---
+    # Smoothed: always at weight 1.0 (spec: "Always included").
+    # Raw: at weight 0.5 when within raw_bl_br_tau_px of smoothed.
+    for idx in (_CORNER_BL, _CORNER_BR):
+        s_xy = (float(screen_corners[idx, 0]), float(screen_corners[idx, 1]))
+        corrs.append(Correspondence(
+            screen_xy=s_xy,
+            frame_xy=(float(smoothed_corners[idx, 0]), float(smoothed_corners[idx, 1])),
+            weight=1.0,
+            source="corner_smoothed",
+        ))
+        if raw_corners is not None:
+            delta = float(np.hypot(
+                raw_corners[idx, 0] - smoothed_corners[idx, 0],
+                raw_corners[idx, 1] - smoothed_corners[idx, 1],
+            ))
+            if delta < raw_bl_br_tau_px:
+                corrs.append(Correspondence(
+                    screen_xy=s_xy,
+                    frame_xy=(float(raw_corners[idx, 0]), float(raw_corners[idx, 1])),
+                    weight=0.5,
+                    source="corner_raw",
+                ))
+
+    # --- Top corners (TL, TR) ---
+    # Both smoothed (0.3) and raw (0.1) are included only when the raw-smoothed
+    # delta is small enough to trust the detection. If raw_corners is absent we
+    # cannot assess quality, so both are omitted conservatively (pre-flight
+    # check 2 shows TR can be 235 px off on occlusion frames).
+    if raw_corners is not None:
+        for idx in (_CORNER_TL, _CORNER_TR):
+            delta = float(np.hypot(
+                raw_corners[idx, 0] - smoothed_corners[idx, 0],
+                raw_corners[idx, 1] - smoothed_corners[idx, 1],
+            ))
+            if delta < raw_tl_tr_tau_px:
+                s_xy = (float(screen_corners[idx, 0]), float(screen_corners[idx, 1]))
+                corrs.append(Correspondence(
+                    screen_xy=s_xy,
+                    frame_xy=(float(smoothed_corners[idx, 0]), float(smoothed_corners[idx, 1])),
+                    weight=0.3,
+                    source="corner_smoothed",
+                ))
+                corrs.append(Correspondence(
+                    screen_xy=s_xy,
+                    frame_xy=(float(raw_corners[idx, 0]), float(raw_corners[idx, 1])),
+                    weight=0.1,
+                    source="corner_raw",
+                ))
+
+    # --- Big star (anchor) ---
+    if big_star_screen_xy is not None and big_star_frame_xy is not None:
+        corrs.append(Correspondence(
+            screen_xy=big_star_screen_xy,
+            frame_xy=big_star_frame_xy,
+            weight=big_star_weight,
+            source="big_star",
+        ))
+
+    # --- Small stars ---
+    blend_range = small_star_tau_radius - small_star_radius_blend_tau
+    for det in (small_stars or []):
+        expected = det.source_prediction.expected_radius_px
+        if expected > 0:
+            rel_err = abs(det.equivalent_radius_px - expected) / expected
+        else:
+            rel_err = 0.0
+
+        if rel_err <= small_star_radius_blend_tau:
+            radius_factor = 1.0
+        else:
+            t = min(1.0, (rel_err - small_star_radius_blend_tau) / blend_range)
+            radius_factor = 1.0 - 0.5 * t
+
+        normalized_conf = min(1.0, max(0.0, det.confidence / small_star_confidence_scale))
+        weight = normalized_conf * radius_factor
+
+        corrs.append(Correspondence(
+            screen_xy=det.source_prediction.screen_xy,
+            frame_xy=det.frame_xy_subpix,
+            weight=weight,
+            source="small_star",
+        ))
+
+    return corrs

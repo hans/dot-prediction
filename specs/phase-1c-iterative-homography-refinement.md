@@ -51,8 +51,19 @@
     Tests: 11 new (`test_homography_refinement.py::test_constellation_*`),
     including a confidence-ordering pin verified by flipping the sort
     direction. 113/113 across the project.
-- **Where to resume:** Step 4 — correspondence-builder using the Change-1
-  weighting table. Then `iterate_homography()` controller (Step 5).
+  - **Step 4 — correspondence builder** (`src/homography_refinement.py`).
+    New entry point `build_correspondences(smoothed_corners, screen_corners, ...)`.
+    Implements the Change-1 weighting table: smoothed BL/BR always at 1.0;
+    raw BL/BR at 0.5 if `|raw−smoothed| < 10 px`; smoothed TL/TR at 0.3 and
+    raw at 0.1 if `|raw−smoothed| < 5 px`, otherwise both top-corner entries
+    omitted entirely (including when `raw_corners=None`); big-star at
+    caller-supplied weight (default 1.0); small stars at
+    `confidence/255 × radius_match_factor` where the factor linearly
+    blends from 1.0 at `rel_err ≤ 0.5` down to 0.5 at `tau_radius=1.5`.
+    All thresholds are keyword parameters. 15 new tests cover boundary deltas,
+    clamped confidence, zero-expected-radius, all four source tags, and
+    end-to-end feed into `solve_weighted_homography`. 128/128 across project.
+- **Where to resume:** Step 5 — `iterate_homography()` controller.
 
 ## Goal (recap)
 
