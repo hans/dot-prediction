@@ -63,7 +63,28 @@
     All thresholds are keyword parameters. 15 new tests cover boundary deltas,
     clamped confidence, zero-expected-radius, all four source tags, and
     end-to-end feed into `solve_weighted_homography`. 128/128 across project.
-- **Where to resume:** Step 5 — `iterate_homography()` controller.
+  - **Step 5 — `iterate_homography()` controller** (`src/homography_refinement.py`).
+    New entry point that orchestrates the predict → detect → gate → re-solve loop.
+    Starts from `H_v0 = findHomography(screen_corners, smoothed_corners)` (lstsq,
+    all 4 corners equal weight), optionally anchor-translates via a caller-supplied
+    big-star pair, then iterates up to `k_max=2` times. Each iteration: calls
+    `_predicted_positions` with the current H, runs `detect_constellation` + `apply_quality_gates`,
+    builds correspondences via `build_correspondences`, and re-solves with
+    `solve_weighted_homography`. Terminates with one of five `ConvergenceReason`
+    values: `"k_max"`, `"converged"` (max corner displacement < `convergence_px=0.5`
+    px), `"no_new_stars"` (accepted count didn't grow, checked from iter 2 onward),
+    `"no_predictions"` (empty `predicted_positions` result), or `"solve_failed"`
+    (<4 usable correspondences). Returns `IterationResult(H_refined, correspondences,
+    anchor_less, iterations_run, convergence_reason, steps)` with `steps:
+    list[IterationStep]` for per-iteration eval (each step records `H_in`, `H_out`,
+    `predictions`, `detections`, `rejections`, `correspondences`, `solve_result`).
+    Caller is responsible for matching the global big-star detection to the correct
+    `PredictedStar.screen_xy` before calling. Note: distance-from-anchor window
+    term from the spec is deferred; pass `adaptive_radius_factor` to approximate
+    `base × expected_radius` only. 14 new tests cover all 5 termination paths, both
+    anchor states, step field completeness, H-projection accuracy, and
+    correspondence fallback. 142/142 across the project.
+- **Where to resume:** Step 6 — `notebooks/iterative_homography_eval.py` evaluation notebook.
 
 ## Goal (recap)
 

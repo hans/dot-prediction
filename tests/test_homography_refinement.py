@@ -2,15 +2,19 @@
 
 import cv2
 import numpy as np
+import pandas as pd
 import pytest
 
 from src.homography_refinement import (
     Correspondence,
     GateRejection,
+    IterationResult,
+    IterationStep,
     anchor_translate,
     apply_quality_gates,
     build_correspondences,
     detect_constellation,
+    iterate_homography,
     radius_match_ok,
     resolve_blob_conflicts,
     solve_weighted_homography,
@@ -883,3 +887,293 @@ def test_build_correspondences_result_feeds_solver():
     assert result.H is not None
     assert result.H.shape == (3, 3)
     assert result.method == "lstsq"
+
+
+# ===========================================================================
+# iterate_homography (Phase 1c Step 5)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Shared fixtures for iterate_homography tests
+# ---------------------------------------------------------------------------
+
+# Blank BGR frame — no warm blobs, so detect_constellation returns nothing.
+_IT_FRAME = np.zeros((480, 640, 3), dtype=np.uint8)
+
+# Screen corners: iPad device pixels [TL, TR, BR, BL].
+_IT_SCREEN = np.array(
+    [[0.0, 0.0], [2388.0, 0.0], [2388.0, 1668.0], [0.0, 1668.0]],
+    dtype=np.float64,
+)
+
+# Smoothed corners: a plausible frame-px bounding box for the iPad display.
+_IT_SMOOTHED = np.array(
+    [[100.0, 50.0], [540.0, 50.0], [540.0, 430.0], [100.0, 430.0]],
+    dtype=np.float64,
+)
+
+# Raw corners: very close to smoothed (delta ≈ 2.8 px < both 5 and 10 px thresholds).
+_IT_RAW = _IT_SMOOTHED + 2.0
+
+# Big-star anchor: a point projected near the display center.
+_IT_BIG_SCREEN = (1194.0, 834.0)   # centre of iPad screen
+_IT_BIG_FRAME = (320.0, 240.0)     # roughly centre of frame
+
+_IT_COLS = [
+    "trial_idx", "tpt", "trial_onset", "trial_offset", "reveal_time",
+    "true_x", "true_y",
+]
+
+
+def _it_trials(
+    onset: float = 0.0,
+    offset: float = 10_000.0,
+    reveal_t: float = 0.0,
+    true_x: float = 0.5,
+    true_y: float = 0.5,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        [{
+            "trial_idx": 1, "tpt": 0,
+            "trial_onset": onset, "trial_offset": offset,
+            "reveal_time": reveal_t,
+            "true_x": true_x, "true_y": true_y,
+        }],
+        columns=_IT_COLS,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Return-type and field-presence checks
+# ---------------------------------------------------------------------------
+
+def test_iterate_homography_returns_iteration_result():
+    """iterate_homography returns an IterationResult with the right shape."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=_IT_BIG_FRAME,
+    )
+    assert isinstance(result, IterationResult)
+    assert result.H_refined.shape == (3, 3)
+    assert isinstance(result.correspondences, list)
+    assert isinstance(result.steps, list)
+    assert len(result.steps) == result.iterations_run
+
+
+def test_iterate_homography_steps_have_correct_fields():
+    """Each IterationStep records both H_in and H_out plus all diagnostic lists."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=_IT_BIG_FRAME,
+        k_max=1,
+        convergence_px=0.0,  # disable H-delta convergence
+    )
+    assert result.iterations_run >= 1
+    step = result.steps[0]
+    assert isinstance(step, IterationStep)
+    assert step.H_in.shape == (3, 3)
+    assert step.H_out.shape == (3, 3)
+    assert isinstance(step.predictions, list)
+    assert isinstance(step.detections, list)
+    assert isinstance(step.rejections, list)
+    assert isinstance(step.correspondences, list)
+
+
+# ---------------------------------------------------------------------------
+# Anchor-less path
+# ---------------------------------------------------------------------------
+
+def test_iterate_homography_anchor_less_flag():
+    """When no big-star args are given, anchor_less is True."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        raw_corners=_IT_RAW,
+    )
+    assert result.anchor_less is True
+
+
+def test_iterate_homography_with_anchor_flag():
+    """When both big-star args are given, anchor_less is False."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=_IT_BIG_FRAME,
+    )
+    assert result.anchor_less is False
+
+
+def test_iterate_homography_partial_big_star_is_anchor_less():
+    """Providing only one of the two big-star args is treated as anchor-less."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        # big_star_frame_xy omitted
+    )
+    assert result.anchor_less is True
+
+
+# ---------------------------------------------------------------------------
+# Convergence reasons
+# ---------------------------------------------------------------------------
+
+def test_iterate_homography_no_predictions():
+    """Frame timestamp outside all trials → convergence_reason='no_predictions'."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(onset=0.0, offset=1000.0), 9999.0,  # outside trial window
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=_IT_BIG_FRAME,
+    )
+    assert result.convergence_reason == "no_predictions"
+    assert result.iterations_run == 0
+    assert result.steps == []
+
+
+def test_iterate_homography_solve_failed():
+    """No raw_corners + no big star → only 2 smoothed BL/BR → solve_failed."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        # no raw_corners, no big star → 2 correspondences only → ValueError
+    )
+    assert result.convergence_reason == "solve_failed"
+    assert result.iterations_run == 0
+
+
+def test_iterate_homography_k_max():
+    """With k_max=1 and convergence_px disabled, reason should be 'k_max'."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=_IT_BIG_FRAME,
+        k_max=1,
+        convergence_px=0.0,  # disable H-delta convergence
+    )
+    assert result.convergence_reason == "k_max"
+    assert result.iterations_run == 1
+
+
+def test_iterate_homography_converged():
+    """Large convergence_px threshold triggers 'converged' on the first iteration."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=_IT_BIG_FRAME,
+        k_max=2,
+        convergence_px=1e6,  # any real h_delta is < 1e6
+    )
+    assert result.convergence_reason == "converged"
+    assert result.iterations_run == 1
+
+
+def test_iterate_homography_no_new_stars():
+    """Blank frame: 0 small stars both iterations → 'no_new_stars' after iter 2."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=_IT_BIG_FRAME,
+        k_max=2,
+        convergence_px=0.0,  # disable H-delta convergence
+    )
+    assert result.convergence_reason == "no_new_stars"
+    assert result.iterations_run == 2
+
+
+# ---------------------------------------------------------------------------
+# H_refined properties
+# ---------------------------------------------------------------------------
+
+def test_iterate_homography_h_refined_projects_smoothed_corners():
+    """H_refined should map screen corners close to the smoothed frame corners."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=_IT_BIG_FRAME,
+    )
+    H = result.H_refined
+    for i in range(4):
+        sx, sy = _IT_SCREEN[i]
+        h = H @ np.array([sx, sy, 1.0])
+        fx, fy = h[0] / h[2], h[1] / h[2]
+        # Should land within ~5 px of the smoothed corner (corners dominate the solve)
+        ex, ey = _IT_SMOOTHED[i]
+        assert abs(fx - ex) < 5.0, f"corner {i} x off by {abs(fx - ex):.2f} px"
+        assert abs(fy - ey) < 5.0, f"corner {i} y off by {abs(fy - ey):.2f} px"
+
+
+def test_iterate_homography_h_in_and_h_out_differ_for_anchor():
+    """When an anchor is used, H_in (anchor-translated H_v0) differs from H_out
+    (re-solved from corners + anchor correspondence)."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(), 5000.0,
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=(400.0, 300.0),  # not at the predicted location → shifts H
+        k_max=1,
+        convergence_px=0.0,
+    )
+    assert result.iterations_run == 1
+    step = result.steps[0]
+    assert not np.allclose(step.H_in, step.H_out, atol=1e-6)
+
+
+def test_iterate_homography_no_predictions_preserves_anchor_h():
+    """When no predictions exist, H_refined equals the anchor-translated H_v0."""
+    # Compute H_v0 from corners directly.
+    H_v0_raw, _ = cv2.findHomography(
+        _IT_SCREEN.astype(np.float32), _IT_SMOOTHED.astype(np.float32), method=0,
+    )
+    H_v0 = np.asarray(H_v0_raw, dtype=np.float64)
+    from src.homography_refinement import anchor_translate
+    H_expected = anchor_translate(H_v0, _IT_BIG_SCREEN, _IT_BIG_FRAME)
+
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(onset=0.0, offset=1000.0), 9999.0,  # no predictions
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=_IT_BIG_FRAME,
+    )
+    np.testing.assert_allclose(result.H_refined, H_expected, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Correspondence fallback when no iteration ran
+# ---------------------------------------------------------------------------
+
+def test_iterate_homography_final_corrs_fallback_when_no_steps():
+    """When iterations_run=0, correspondences are built from corners + big star only."""
+    result = iterate_homography(
+        _IT_FRAME, _IT_SMOOTHED, _IT_SCREEN,
+        _it_trials(onset=0.0, offset=1000.0), 9999.0,  # no predictions → 0 steps
+        raw_corners=_IT_RAW,
+        big_star_screen_xy=_IT_BIG_SCREEN,
+        big_star_frame_xy=_IT_BIG_FRAME,
+    )
+    assert result.iterations_run == 0
+    # Should contain corner + big-star correspondences
+    sources = {c.source for c in result.correspondences}
+    assert "corner_smoothed" in sources
+    assert "big_star" in sources
+    assert "small_star" not in sources

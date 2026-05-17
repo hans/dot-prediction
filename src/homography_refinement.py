@@ -31,6 +31,7 @@ from typing import Literal
 
 import cv2
 import numpy as np
+import pandas as pd
 
 try:
     from local_star_detector import (
@@ -38,6 +39,7 @@ try:
         _window_bounds,
         _window_size_for,
     )
+    from predicted_positions import predicted_positions as _predicted_positions
     from predicted_positions import PredictedStar
 except ImportError:
     from src.local_star_detector import (
@@ -45,6 +47,7 @@ except ImportError:
         _window_bounds,
         _window_size_for,
     )
+    from src.predicted_positions import predicted_positions as _predicted_positions
     from src.predicted_positions import PredictedStar
 
 CorrespondenceSource = Literal[
@@ -817,3 +820,276 @@ def build_correspondences(
         ))
 
     return corrs
+
+
+# ---------------------------------------------------------------------------
+# Iteration controller (Phase 1c Step 5)
+# ---------------------------------------------------------------------------
+
+ConvergenceReason = Literal[
+    "k_max",
+    "converged",
+    "no_new_stars",
+    "no_predictions",
+    "solve_failed",
+]
+
+
+@dataclass
+class IterationStep:
+    """Diagnostic snapshot for one refinement iteration.
+
+    Attributes:
+        H_in: Homography used to generate predictions at the start of this
+            iteration.
+        H_out: Homography produced by the weighted re-solve at the end of
+            this iteration.
+        predictions: Stars predicted under ``H_in`` via ``predicted_positions``.
+        detections: Quality-gated accepted detections.
+        rejections: Detections dropped by the quality gates.
+        correspondences: Weighted correspondence set fed to the re-solver.
+        solve_result: Output of ``solve_weighted_homography``.
+    """
+
+    H_in: np.ndarray
+    H_out: np.ndarray
+    predictions: list[PredictedStar]
+    detections: list[LocalDetection]
+    rejections: list[GateRejection]
+    correspondences: list[Correspondence]
+    solve_result: SolveResult
+
+
+@dataclass
+class IterationResult:
+    """Output of ``iterate_homography``.
+
+    Attributes:
+        H_refined: Final homography mapping screen px → frame px.
+        correspondences: Correspondence set from the last completed iteration,
+            or a corner-only set if no iteration produced a solve.
+        anchor_less: True when no big-star anchor was supplied; the initial
+            H is then purely corner-based (lower accuracy ceiling).
+        iterations_run: Number of full refinement iterations completed (0 if
+            the loop exited before the first solve).
+        convergence_reason: Why iteration stopped — ``"k_max"`` (budget
+            exhausted), ``"converged"`` (H displacement < ``convergence_px``),
+            ``"no_new_stars"`` (accepted count did not grow), ``"no_predictions"``
+            (no stars predicted at this timestamp), or ``"solve_failed"``
+            (fewer than 4 usable correspondences).
+        steps: Per-iteration diagnostic snapshots; ``len(steps) == iterations_run``.
+    """
+
+    H_refined: np.ndarray
+    correspondences: list[Correspondence]
+    anchor_less: bool
+    iterations_run: int
+    convergence_reason: ConvergenceReason
+    steps: list[IterationStep]
+
+
+def _max_corner_displacement(
+    H_prev: np.ndarray,
+    H_new: np.ndarray,
+    screen_corners: np.ndarray,
+) -> float:
+    """Max frame-px displacement of the 4 screen corners between two H's."""
+    sc = screen_corners.astype(np.float64)
+    prev = _project_many(H_prev, sc)
+    new_ = _project_many(H_new, sc)
+    return float(np.max(np.hypot(*(new_ - prev).T)))
+
+
+def iterate_homography(
+    frame: np.ndarray,
+    smoothed_corners: np.ndarray,
+    screen_corners: np.ndarray,
+    trials_df: pd.DataFrame,
+    frame_t_ms: float,
+    *,
+    raw_corners: np.ndarray | None = None,
+    big_star_screen_xy: tuple[float, float] | None = None,
+    big_star_frame_xy: tuple[float, float] | None = None,
+    big_star_weight: float = 1.0,
+    k_max: int = 2,
+    convergence_px: float = 0.5,
+    tau_centroid_px: float = 3.0,
+    tau_radius: float = 1.5,
+    window_size_px: int = 40,
+    floor: float = 20.0,
+    max_radius_factor: float = 4.0,
+    adaptive_radius_factor: float | None = None,
+) -> IterationResult:
+    """Iterative homography refinement for a single video frame.
+
+    Orchestrates the predict → detect → gate → re-solve loop described in
+    the Phase-1c spec (pipeline section). Produces a refined homography and
+    a quality-gated set of star correspondences.
+
+    **Initialization:**
+    1. Solve ``H_v0`` from ``smoothed_corners`` via lstsq (all 4 corners,
+       equal weight — matching the corner smoother's output directly).
+    2. If ``big_star_screen_xy`` / ``big_star_frame_xy`` are both provided,
+       anchor-translate ``H_v0`` → ``H_v1`` to fix the translation error.
+       Otherwise ``anchor_less=True`` and ``H_v0`` is the starting point.
+
+    **Each iteration k (k = 1 … k_max):**
+    3. Predict small-star positions via the behavioral log + current H.
+    4. Detect blobs with ``detect_constellation`` (greedy, handles overlaps).
+    5. Apply quality gates (radius check + same-blob resolver).
+    6. Build weighted correspondences per the Change-1 weighting table.
+    7. Re-solve H via ``solve_weighted_homography`` (lstsq default).
+
+    **Termination** (first condition met):
+    - ``"converged"``: max corner displacement ΔH < ``convergence_px`` (0.5 px).
+    - ``"no_new_stars"``: accepted small-star count ≤ previous iteration's
+      count (checked from iteration 2 onward).
+    - ``"k_max"``: ``k_max`` iterations completed without early exit.
+    - ``"no_predictions"``: no stars predicted at ``frame_t_ms``.
+    - ``"solve_failed"``: fewer than 4 usable correspondences.
+
+    **Adaptive window note:** The spec's distance-from-anchor term
+    (``α × distance_from_anchor_px``) is not implemented; pass
+    ``adaptive_radius_factor`` to approximate the ``base × expected_radius``
+    component only.
+
+    Args:
+        frame: BGR uint8 image, shape ``(H, W, 3)``.
+        smoothed_corners: ``(4, 2)`` float array ``[TL, TR, BR, BL]`` of
+            rolling-median-smoothed corners in frame pixels.
+        screen_corners: ``(4, 2)`` float array ``[TL, TR, BR, BL]`` of the
+            canonical iPad screen-edge corners in device pixels.
+        trials_df: Behavioral log DataFrame (columns: ``trial_idx``, ``tpt``,
+            ``trial_onset``, ``trial_offset``, ``reveal_time``, ``true_x``,
+            ``true_y``).
+        frame_t_ms: Frame timestamp in the experiment clock (ms).
+        raw_corners: Optional ``(4, 2)`` raw (per-frame) corner detections.
+            When *None*, raw and smoothed top-corner correspondences are both
+            omitted (only smoothed BL/BR remain from corners).
+        big_star_screen_xy: iPad screen-pixel position of the big-star anchor.
+            Caller is responsible for matching ``detect_stars`` output to the
+            correct ``PredictedStar.screen_xy`` from the behavioral log.
+            *None* → anchor-less path.
+        big_star_frame_xy: Detected frame-pixel position of the big star.
+            Paired with ``big_star_screen_xy``; ignored if that is *None*.
+        big_star_weight: Correspondence weight for the big star (default 1.0).
+        k_max: Maximum refinement iterations (default 2, per spec Change-2).
+        convergence_px: H-delta convergence threshold in frame pixels
+            (default 0.5). Set to 0 to disable H-delta convergence.
+        tau_centroid_px: Same-blob clustering threshold for quality gates.
+        tau_radius: Radius-match relative-error gate threshold.
+        window_size_px: Fixed detection-window side length (px); used when
+            ``adaptive_radius_factor`` is *None*.
+        floor: R−B opponent-channel floor for blob detection.
+        max_radius_factor: Reject blobs whose equivalent radius exceeds this
+            multiple of the prediction's expected radius.
+        adaptive_radius_factor: When set, each prediction's window is
+            ``factor × expected_radius_px`` (clipped to ``[min_window_px,
+            max_window_px]``). Overrides ``window_size_px``.
+
+    Returns:
+        ``IterationResult`` with the refined H, final correspondences,
+        per-iteration diagnostic steps, and convergence metadata.
+    """
+    # Solve H_v0 from all 4 smoothed corners (lstsq, equal weight).
+    H_v0_raw, _ = cv2.findHomography(
+        screen_corners.astype(np.float32),
+        smoothed_corners.astype(np.float32),
+        method=0,
+    )
+    if H_v0_raw is None:
+        raise ValueError(
+            "cv2.findHomography failed to compute H_v0 from smoothed corners."
+        )
+    H_v0 = np.asarray(H_v0_raw, dtype=np.float64)
+
+    anchor_less = big_star_screen_xy is None or big_star_frame_xy is None
+    H_current = (
+        H_v0 if anchor_less
+        else anchor_translate(H_v0, big_star_screen_xy, big_star_frame_xy)
+    )
+
+    steps: list[IterationStep] = []
+    convergence_reason: ConvergenceReason = "k_max"
+    prev_n_accepted: int | None = None
+
+    for _ in range(k_max):
+        H_in = H_current
+
+        predictions = _predicted_positions(frame_t_ms, trials_df, H_current)
+        if not predictions:
+            convergence_reason = "no_predictions"
+            break
+
+        detections_all, _ = detect_constellation(
+            frame, predictions,
+            window_size_px=window_size_px,
+            floor=floor,
+            max_radius_factor=max_radius_factor,
+            adaptive_radius_factor=adaptive_radius_factor,
+        )
+        accepted, rejections = apply_quality_gates(
+            detections_all,
+            tau_centroid_px=tau_centroid_px,
+            tau_radius=tau_radius,
+        )
+
+        corrs = build_correspondences(
+            smoothed_corners, screen_corners,
+            raw_corners=raw_corners,
+            big_star_screen_xy=big_star_screen_xy,
+            big_star_frame_xy=big_star_frame_xy,
+            big_star_weight=big_star_weight,
+            small_stars=accepted,
+        )
+
+        try:
+            solve_result = solve_weighted_homography(corrs)
+        except ValueError:
+            convergence_reason = "solve_failed"
+            break
+
+        H_new = solve_result.H
+        steps.append(IterationStep(
+            H_in=H_in,
+            H_out=H_new,
+            predictions=predictions,
+            detections=accepted,
+            rejections=rejections,
+            correspondences=corrs,
+            solve_result=solve_result,
+        ))
+
+        n_accepted = len(accepted)
+        h_delta = _max_corner_displacement(H_current, H_new, screen_corners)
+        H_current = H_new
+
+        if h_delta < convergence_px:
+            convergence_reason = "converged"
+            break
+
+        if prev_n_accepted is not None and n_accepted <= prev_n_accepted:
+            convergence_reason = "no_new_stars"
+            break
+
+        prev_n_accepted = n_accepted
+
+    final_corrs = (
+        steps[-1].correspondences if steps
+        else build_correspondences(
+            smoothed_corners, screen_corners,
+            raw_corners=raw_corners,
+            big_star_screen_xy=big_star_screen_xy,
+            big_star_frame_xy=big_star_frame_xy,
+            big_star_weight=big_star_weight,
+        )
+    )
+
+    return IterationResult(
+        H_refined=H_current,
+        correspondences=final_corrs,
+        anchor_less=anchor_less,
+        iterations_run=len(steps),
+        convergence_reason=convergence_reason,
+        steps=steps,
+    )
