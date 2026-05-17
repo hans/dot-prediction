@@ -16,6 +16,9 @@ re-solve until convergence. This module provides the building blocks:
 * ``solve_weighted_homography`` — weighted-DLT/RANSAC re-solve via the
   repeated-points trick, returning H plus per-correspondence residuals
   and an inlier mask.
+* ``apply_quality_gates`` — radius-match + same-blob-snapping filter over
+  ``LocalDetection`` outputs (with ``radius_match_ok`` and
+  ``resolve_blob_conflicts`` as the per-gate helpers).
 """
 
 from __future__ import annotations
@@ -25,6 +28,11 @@ from typing import Literal
 
 import cv2
 import numpy as np
+
+try:
+    from local_star_detector import LocalDetection
+except ImportError:
+    from src.local_star_detector import LocalDetection
 
 CorrespondenceSource = Literal[
     "corner_smoothed",
@@ -224,3 +232,176 @@ def solve_weighted_homography(
     return SolveResult(
         H=H, inlier_mask=full_inlier, residuals_px=full_residuals, method=method
     )
+
+
+# ---------------------------------------------------------------------------
+# Quality gates on local-detector outputs (Phase 1c Step 2)
+# ---------------------------------------------------------------------------
+
+GateRejectionReason = Literal["radius_mismatch", "same_blob"]
+
+
+@dataclass(frozen=True)
+class GateRejection:
+    """One detection that was filtered out by ``apply_quality_gates``.
+
+    Attributes:
+        detection: The ``LocalDetection`` that was rejected.
+        reason: Which gate dropped it — ``"radius_mismatch"`` (equivalent
+            radius too far from expected) or ``"same_blob"`` (clustered
+            with another detection and lost the conflict-resolver tiebreak).
+    """
+
+    detection: LocalDetection
+    reason: GateRejectionReason
+
+
+def radius_match_ok(
+    detection: LocalDetection,
+    *,
+    tau_radius: float = 1.5,
+) -> bool:
+    """True if the detection's equivalent radius matches its prediction.
+
+    Uses the same relative-error formulation as Change 1's downweight rule:
+    accept iff ``|equivalent_radius − expected_radius| / expected_radius ≤
+    tau_radius``. With ``tau_radius=1.5`` this admits observed radii in
+    ``[0, 2.5 × expected]`` (the spec's "factor of ~2.5"). Predictions with
+    ``expected_radius_px ≤ 0`` skip the check (no model available).
+
+    The local detector already applies a generous ``max_radius_factor=4.0``
+    one-sided hard reject; this gate is the tighter per-frame filter that
+    feeds the homography re-solver.
+    """
+    expected = detection.source_prediction.expected_radius_px
+    if expected <= 0:
+        return True
+    rel_err = abs(detection.equivalent_radius_px - expected) / expected
+    return rel_err <= tau_radius
+
+
+def _cluster_indices_by_distance(
+    points: np.ndarray, tau_px: float,
+) -> list[list[int]]:
+    """Single-link cluster (N, 2) ``points`` by Euclidean distance < tau_px.
+
+    Returns a list of clusters, each a list of row indices into ``points``.
+    """
+    n = len(points)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    tau_sq = tau_px * tau_px
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = points[i, 0] - points[j, 0]
+            dy = points[i, 1] - points[j, 1]
+            if dx * dx + dy * dy < tau_sq:
+                union(i, j)
+
+    clusters: dict[int, list[int]] = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+    return list(clusters.values())
+
+
+def resolve_blob_conflicts(
+    detections: list[LocalDetection],
+    *,
+    tau_centroid_px: float = 3.0,
+) -> tuple[list[LocalDetection], list[LocalDetection]]:
+    """Collapse same-blob-snapping clusters down to one detection each.
+
+    Two detections belong to the same cluster if their ``frame_xy_subpix``
+    are within ``tau_centroid_px`` (single-link). Within each cluster of
+    size ≥ 2, the winner is the detection whose **source prediction's**
+    ``frame_xy`` is closest to the cluster centroid (mean of the
+    detections' sub-pixel centroids). All other detections in the cluster
+    are rejected — per spec, no secondary-peak search is attempted in the
+    same window.
+
+    Args:
+        detections: Local-detector outputs to filter.
+        tau_centroid_px: Clustering distance threshold (default 3 px per
+            the spec's τ_centroid).
+
+    Returns:
+        ``(accepted, rejected)`` partitioning the input list. Singleton
+        clusters always end up in ``accepted``. Order within each list is
+        the order of first appearance in ``detections``.
+    """
+    if not detections:
+        return [], []
+
+    centroids = np.array(
+        [d.frame_xy_subpix for d in detections], dtype=np.float64,
+    )
+    clusters = _cluster_indices_by_distance(centroids, tau_centroid_px)
+
+    accepted_idx: set[int] = set()
+    for cluster in clusters:
+        if len(cluster) == 1:
+            accepted_idx.add(cluster[0])
+            continue
+        cx, cy = centroids[cluster].mean(axis=0)
+        # Tiebreak by smallest squared distance from prediction to centroid.
+        def dist_sq(i: int, cx: float = cx, cy: float = cy) -> float:
+            px, py = detections[i].source_prediction.frame_xy
+            return (px - cx) ** 2 + (py - cy) ** 2
+        winner = min(cluster, key=dist_sq)
+        accepted_idx.add(winner)
+
+    accepted = [d for i, d in enumerate(detections) if i in accepted_idx]
+    rejected = [d for i, d in enumerate(detections) if i not in accepted_idx]
+    return accepted, rejected
+
+
+def apply_quality_gates(
+    detections: list[LocalDetection],
+    *,
+    tau_centroid_px: float = 3.0,
+    tau_radius: float = 1.5,
+) -> tuple[list[LocalDetection], list[GateRejection]]:
+    """Filter local detections through Phase-1c quality gates.
+
+    Gates, applied in order:
+
+    1. **Radius match** (``radius_match_ok``) — drop detections whose
+       equivalent radius is more than ``tau_radius`` away from the
+       prediction's expected radius in relative-error terms.
+    2. **Same-blob conflict** (``resolve_blob_conflicts``) — collapse
+       clusters of detections within ``tau_centroid_px`` to a single
+       winner (the one whose prediction is closest to the cluster
+       centroid).
+
+    Running radius first avoids the case where a radius-bad detection
+    wins the centroid tiebreak over a radius-good one in the same
+    cluster.
+
+    Returns:
+        ``(accepted, rejections)``. ``rejections`` tags each dropped
+        detection with the gate that filtered it for diagnostics.
+    """
+    rejections: list[GateRejection] = []
+    radius_ok: list[LocalDetection] = []
+    for d in detections:
+        if radius_match_ok(d, tau_radius=tau_radius):
+            radius_ok.append(d)
+        else:
+            rejections.append(GateRejection(d, "radius_mismatch"))
+
+    accepted, blob_rejected = resolve_blob_conflicts(
+        radius_ok, tau_centroid_px=tau_centroid_px,
+    )
+    rejections.extend(GateRejection(d, "same_blob") for d in blob_rejected)
+    return accepted, rejections

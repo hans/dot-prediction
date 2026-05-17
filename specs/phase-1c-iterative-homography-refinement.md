@@ -17,12 +17,26 @@
     aligned to the *input* list (zero-weight entries → False / NaN).
     Tests: `tests/test_homography_refinement.py` covers clean recovery,
     least-squares path, RANSAC outlier rejection, weight-biasing, <4-point
-    rejection, zero-weight handling (10/10 passing).
-- **Where to resume:** Step 2 — detection quality gates (centroid
-  distinctness τ=3 px, equivalent-radius match τ=1.5, conflict resolver for
-  same-blob snapping) per the "Quality gates" section. Then greedy
-  constellation matcher (Step 3), correspondence-builder using the Change-1
-  weighting table (Step 4), and `iterate_homography()` controller (Step 5).
+    rejection, zero-weight handling.
+  - **Step 2 — detection quality gates** (`src/homography_refinement.py`).
+    Three new symbols: `radius_match_ok(det, *, tau_radius=1.5)` —
+    relative-error gate `|obs−exp|/exp ≤ τ` (matches Change-1's downweight
+    formula; permissive when `expected_radius_px ≤ 0`);
+    `resolve_blob_conflicts(dets, *, tau_centroid_px=3.0)` — single-link
+    cluster on `frame_xy_subpix`, per-cluster winner is the detection whose
+    source prediction's `frame_xy` is closest to the cluster centroid
+    (singletons pass through); `apply_quality_gates(dets, ...)` — radius
+    gate then resolver (in that order, so a radius-bad detection can't win
+    a centroid tiebreak), returning `(accepted, [GateRejection(d, reason)])`
+    with reasons `"radius_mismatch"` / `"same_blob"`. Tests cover both gates
+    individually and end-to-end (22/22 passing in the file; 102/102 across
+    the project).
+- **Where to resume:** Step 3 — greedy constellation matcher for the
+  overlapping-window case (independent per-window detection when windows
+  don't overlap; greedy assign in descending confidence to nearest
+  prediction within window radius when they do). Then correspondence-builder
+  using the Change-1 weighting table (Step 4), and `iterate_homography()`
+  controller (Step 5).
 
 ## Goal (recap)
 
