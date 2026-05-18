@@ -29,3 +29,24 @@ subjects:
       smooth_env_s: 0.01
       min_sep_s: 0.1
       prom_z: 3.5
+
+# Behavior task canvas geometry (iPad Safari, physical screen pixels at 2× Retina).
+# The task canvas does not fill the full iPad screen: Safari shows a URL bar at the
+# top, and the webpage adds symmetric left/right white padding.  These constants
+# convert normalised task coordinates (true_x, true_y) to physical screen-pixel
+# positions for homography-based gaze mapping.  Empirically derived by
+# back-projecting hand-labeled big_star positions through the 4-corner homography.
+#
+# Sanity checks (see behavior_to_screen() in src/homography_solver.py):
+#   behavior_to_screen(0,    max_y) → (x_pad_px,              screen_h)  [canvas BL]
+#   behavior_to_screen(1,    max_y) → (screen_w - x_pad_px,   screen_h)  [canvas BR]
+#   behavior_to_screen(0.5,  0)     → (screen_w/2,             url_bar_h) [canvas top-centre]
+behavior_canvas:
+  # Safari URL bar height in physical px (≈136 CSS px at 2× display scale).
+  # Defines the offset from the screen top edge to the top of the webpage canvas.
+  url_bar_h_px: 272
+  # Symmetric white padding between the screen left/right edge and the canvas (px each side).
+  x_pad_px: 233
+  # Maximum true_y value in the task; dots are confined to [0, max_y] of canvas height.
+  # true_y = max_y maps to the physical bottom of the screen.
+  max_y: 0.75
