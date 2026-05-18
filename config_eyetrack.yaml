@@ -7,3 +7,9 @@ subjects:
 clip_start_s: 120.0
 clip_duration_s: 30.0
 smoothing_window: 10
+
+# iPad Safari canvas geometry — matches config.yaml for cross-pipeline consistency.
+behavior_canvas:
+  url_bar_h_px: 272
+  x_pad_px: 233
+  max_y: 0.75

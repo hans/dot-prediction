@@ -1,4 +1,39 @@
+import os
+import sys
+import tempfile
 from pathlib import Path
+
+_EXTRA_PATHS = ["src"]
+for p in _EXTRA_PATHS:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    _EXTRA_PATHS + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])
+)
+
+
+def run_notebook(input_path, output_path, parameters):
+    """Execute a notebook (.ipynb or jupytext .py-percent) with ploomber_engine."""
+    import jupytext
+    from ploomber_engine import execute_notebook
+
+    input_path = Path(input_path)
+    if input_path.suffix == ".py":
+        nb = jupytext.read(input_path)
+        with tempfile.NamedTemporaryFile(suffix=".ipynb", delete=False) as f:
+            tmp_path = Path(f.name)
+        jupytext.write(nb, tmp_path)
+    else:
+        tmp_path = None
+
+    try:
+        actual_input = tmp_path if tmp_path is not None else input_path
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        return execute_notebook(str(actual_input), str(output_path), parameters=parameters)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
 
 configfile: "config_eyetrack.yaml"
 
@@ -32,6 +67,48 @@ rule render_screen_gaze:
         "--video {input.video} --tsv {input.tsv} "
         "--start {params.start} --duration {params.duration} "
         "--output {output.mp4}"
+
+
+rule detect_screen_corners:
+    input:
+        video=lambda wc: f"{subj(wc)['tobii_dir']}/{subj(wc)['scene_video']}",
+    output:
+        parquet="results/{subject}/screen_corners.parquet",
+    script:
+        "scripts/detect_screen_corners.py"
+
+
+rule phase1c_homography:
+    input:
+        video=lambda wc: f"{subj(wc)['tobii_dir']}/{subj(wc)['scene_video']}",
+        labels="results/{subject}/homography_labels.parquet",
+        calibration="results/{subject}/homography_eval/homography_box_calibration.json",
+        screen_corners=rules.detect_screen_corners.output.parquet,
+        trials="results/{subject}/trials_with_video.parquet",
+        notebook="notebooks/phase1c_eval.py",
+    output:
+        per_frame="results/{subject}/phase1c_per_frame.parquet",
+        calibration_used="results/{subject}/phase1c_calibration_used.json",
+        notebook="results/{subject}/notebooks/phase1c_eval.ipynb",
+    run:
+        canvas = config.get("behavior_canvas", {})
+        run_notebook(
+            input.notebook,
+            output.notebook,
+            parameters=dict(
+                subject=wildcards.subject,
+                video_path=input.video,
+                labels_path=input.labels,
+                calibration_path=input.calibration,
+                screen_corners_path=input.screen_corners,
+                trials_path=input.trials,
+                out_per_frame=output.per_frame,
+                out_calibration=output.calibration_used,
+                URL_BAR_H_PX=canvas.get("url_bar_h_px", 272),
+                CANVAS_X_PAD_PX=canvas.get("x_pad_px", 233),
+                MAX_Y_COORD=canvas.get("max_y", 0.75),
+            ),
+        )
 
 
 # Future rules (not yet implemented):
