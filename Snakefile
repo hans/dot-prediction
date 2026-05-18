@@ -94,10 +94,6 @@ rule all:
             subject=SUBJECTS,
             band=BANDS,
         ),
-        expand(
-            "results/{subject}/notebooks/homography_eval.ipynb",
-            subject=SUBJECTS,
-        ),
 
 
 rule extract_photodiode:
@@ -216,31 +212,3 @@ rule prediction_error:
         )
 
 
-rule homography_solver:
-    input:
-        labels="results/{subject}/homography_labels.parquet",
-        trials="results/{subject}/trials_with_video.parquet",
-        align="results/{subject}/video_alignment.json",
-        video="data/{subject}/tobii/scenevideo.mp4",
-        notebook="notebooks/homography_eval.py",
-    output:
-        calibration="results/{subject}/homography_eval/homography_box_calibration.json",
-        per_frame="results/{subject}/homography_eval/homography_per_frame.parquet",
-        notebook="results/{subject}/notebooks/homography_eval.ipynb",
-    run:
-        canvas = config.get("behavior_canvas", {})
-        run_notebook(
-            input.notebook,
-            output.notebook,
-            parameters=dict(
-                subject=wildcards.subject,
-                video_path=input.video,
-                labels_path=input.labels,
-                trials_path=input.trials,
-                align_path=input.align,
-                out_dir=str(Path(output.calibration).parent),
-                URL_BAR_H_PX=canvas.get("url_bar_h_px", 272),
-                CANVAS_X_PAD_PX=canvas.get("x_pad_px", 233),
-                MAX_Y_COORD=canvas.get("max_y", 0.75),
-            ),
-        )
