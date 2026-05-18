@@ -32,6 +32,9 @@ def detect_box_corner(
     Returns:
         (x, y) in frame pixel coordinates, or None.
     """
+    if not (np.isfinite(predicted_xy[0]) and np.isfinite(predicted_xy[1])):
+        return None
+
     H, W = frame.shape[:2]
     cx = int(round(predicted_xy[0]))
     cy = int(round(predicted_xy[1]))

@@ -58,6 +58,13 @@ def test_uniform_patch_returns_none():
     assert result is None
 
 
+def test_nan_prediction_returns_none():
+    """NaN prediction coordinates return None without raising."""
+    frame = _make_corner_frame()
+    assert detect_box_corner(frame, (float("nan"), float("nan")), corner="bl") is None
+    assert detect_box_corner(frame, (100.0, float("nan")), corner="bl") is None
+
+
 def test_prediction_outside_frame_returns_none():
     """Prediction far outside the frame; window is empty → None."""
     frame = _make_corner_frame()
