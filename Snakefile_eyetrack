@@ -119,6 +119,9 @@ rule phase1c_homography:
     output:
         per_frame="results/{subject}/phase1c_per_frame.parquet",
         calibration_used="results/{subject}/phase1c_calibration_used.json",
+        trajectory="results/{subject}/cascade_trajectory.png",
+        residual_hist="results/{subject}/big_star_residual_hist.png",
+        residual_scatter="results/{subject}/big_star_residual_vs_frame.png",
         notebook="results/{subject}/notebooks/phase1c_eval.ipynb",
     run:
         canvas = config.get("behavior_canvas", {})
@@ -134,6 +137,9 @@ rule phase1c_homography:
                 trials_path=input.trials,
                 out_per_frame=output.per_frame,
                 out_calibration=output.calibration_used,
+                out_trajectory=output.trajectory,
+                out_residual_hist=output.residual_hist,
+                out_residual_scatter=output.residual_scatter,
                 URL_BAR_H_PX=canvas.get("url_bar_h_px", 272),
                 CANVAS_X_PAD_PX=canvas.get("x_pad_px", 233),
                 MAX_Y_COORD=canvas.get("max_y", 0.75),

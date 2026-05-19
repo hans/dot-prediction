@@ -82,7 +82,10 @@ frame_indices: list[int] = [
       18973, 19671, 20129, 20192, # early/mid/late/intertrial tr13
       30125, 30135, 30175,        # head-jumps + intertrial near tr19→tr20
       30232, 30950, 31423,        # early/mid/late tr20
-  ]
+
+    # manually added based on trajectory results
+    900, 4000, 7500, 26000, 5000, 5500, 5750,
+]
 
 # Candidate-picker knobs
 picker_corner_stride = 25         # frames between detect_corners samples for head-motion proxy
@@ -836,3 +839,5 @@ if labels:
             print(f"    screen_y: median={sub.screen_y.median():.1f}  min={sub.screen_y.min():.1f}  max={sub.screen_y.max():.1f}")
 else:
     print("(no labels yet)")
+
+# %%

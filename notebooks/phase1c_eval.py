@@ -1,18 +1,3 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python 3 (ipykernel)
-#     language: python
-#     name: python3
-# ---
-
 # %% [markdown]
 # # Phase 1c — box corner detector evaluation
 #
@@ -26,6 +11,7 @@
 # %% tags=["parameters"]
 import sys
 from pathlib import Path
+from tqdm.auto import tqdm, trange
 
 _ROOT = (
     Path(__file__).resolve().parent.parent
@@ -37,13 +23,13 @@ _ROOT = (
 sys.path.insert(0, str(_ROOT / "src"))
 
 subject = "EC347"
-video_path = str(_ROOT / f"data/{subject}/tobii/scenevideo.mp4")
+video_path = _ROOT / f"data/{subject}/tobii/scenevideo.mp4"
 labels_path = str(_ROOT / f"results/{subject}/homography_labels.parquet")
 calibration_path = str(_ROOT / f"results/{subject}/homography_eval/homography_box_calibration.json")
 screen_corners_path = str(_ROOT / f"results/{subject}/screen_corners.parquet")
 trials_path = str(_ROOT / f"results/{subject}/trials_with_video.parquet")
-out_per_frame = str(_ROOT / f"results/{subject}/phase1c_per_frame.parquet")
-out_calibration = str(_ROOT / f"results/{subject}/phase1c_calibration_used.json")
+out_per_frame = str(_ROOT / f"results_scratch/{subject}/phase1c_per_frame.parquet")
+out_calibration = str(_ROOT / f"results_scratch/{subject}/phase1c_calibration_used.json")
 
 SCREEN_W_PX = 2388
 SCREEN_H_PX = 1668
@@ -52,7 +38,13 @@ CANVAS_X_PAD_PX = 233
 MAX_Y_COORD = 0.75
 
 SEED_FRAME = 664
-SPOT_CHECK_FRAMES = [664, 1550, 2288, 30125]
+# Frames to render as spot-check overlays. Empty list → auto-select seed frame
+# + top-8 worst-residual frames after the run completes.
+SPOT_CHECK_FRAMES: list[int] = []
+
+out_trajectory = str(Path(out_per_frame).parent / "cascade_trajectory.png")
+out_residual_hist = str(Path(out_per_frame).parent / "big_star_residual_hist.png")
+out_residual_scatter = str(Path(out_per_frame).parent / "big_star_residual_vs_frame.png")
 
 LABEL_COLORS_HEX = {
     "screen_bl": "#ffcc00",
@@ -238,15 +230,30 @@ def _empty_result(t: int) -> dict:
     }
 
 
-def _process_frame(frame_bgr: np.ndarray, t: int, H_prev: np.ndarray) -> tuple[dict, np.ndarray | None]:
-    """Run one detection step. Returns (result_dict, new_H or None)."""
+def _process_frame(
+    frame_bgr: np.ndarray,
+    t: int,
+    H_prev: np.ndarray,
+    box_labels: dict | None = None,
+) -> tuple[dict, np.ndarray | None]:
+    """Run one detection step. Returns (result_dict, new_H or None).
+
+    If box_labels contains an entry for frame t, use the labeled positions
+    directly instead of running the detector (re-anchors the tracker).
+    box_labels format: {frame_idx: {'bl': (x, y), 'br': (x, y)}}
+    """
     r = _empty_result(t)
 
-    box_bl_pred = _pt(H_prev, box_bl_screen)
-    box_br_pred = _pt(H_prev, box_br_screen)
-
-    box_bl_det = detect_box_corner(frame_bgr, box_bl_pred, "bl")
-    box_br_det = detect_box_corner(frame_bgr, box_br_pred, "br")
+    # Use hand labels as detection result when available (re-anchor).
+    if box_labels and t in box_labels:
+        lbl = box_labels[t]
+        box_bl_det = lbl.get("bl")
+        box_br_det = lbl.get("br")
+    else:
+        box_bl_pred = _pt(H_prev, box_bl_screen)
+        box_br_pred = _pt(H_prev, box_br_screen)
+        box_bl_det = detect_box_corner(frame_bgr, box_bl_pred, "bl")
+        box_br_det = detect_box_corner(frame_bgr, box_br_pred, "br")
 
     # Step C: screen corners
     if t not in screen_corners_df.index:
@@ -284,6 +291,17 @@ def _process_frame(frame_bgr: np.ndarray, t: int, H_prev: np.ndarray) -> tuple[d
 
     r["box_bl_x"], r["box_bl_y"] = box_bl_det
     r["box_br_x"], r["box_br_y"] = box_br_det
+
+    # Geometric sanity check: bl must be meaningfully left of br (device width
+    # appears ≈48–56 px in frame), corners on same horizontal edge (small y-diff).
+    # Skip for label-override frames (trusted ground truth).
+    is_label_frame = box_labels is not None and t in box_labels
+    horiz_sep = box_br_det[0] - box_bl_det[0]
+    vert_spread = abs(box_bl_det[1] - box_br_det[1])
+    if not is_label_frame and (horiz_sep < 15 or horiz_sep > 80 or vert_spread > 30):
+        r["detection_status"] = "geometric_invalid"
+        r["detection_reason"] = f"horiz_sep={horiz_sep:.0f},vert_spread={vert_spread:.0f}"
+        return r, None
 
     frame_pts = np.array([
         [sc.screen_bl_x, sc.screen_bl_y],
@@ -340,6 +358,36 @@ seed_result.update({
 print(f"Seed H built from frame {SEED_FRAME} hand labels.")
 
 # %%
+# Build label-override dict: use trusted box_bl/box_br labels to re-anchor
+# the tracker at frames where hand labels are available and visible.
+# big_star validation frames are EXCLUDED from the override so that the held-out
+# residual measures real tracker quality rather than label-override quality.
+_big_star_val_frames = set(
+    int(f) for f in labels_df[
+        (labels_df.label_type == "big_star")
+        & (labels_df.visible == True)
+        & (labels_df.quality == "confident")
+    ].frame_idx.unique()
+)
+
+_box_labels_df = labels_df[
+    labels_df.label_type.isin(["box_bl", "box_br"]) & (labels_df.visible == True)
+]
+_box_labels: dict[int, dict] = {}
+for fidx, grp in _box_labels_df.groupby("frame_idx"):
+    if int(fidx) in _big_star_val_frames:
+        continue  # held out for validation — do not override tracker
+    entry: dict = {}
+    for _, row in grp.iterrows():
+        key = "bl" if row.label_type == "box_bl" else "br"
+        entry[key] = (float(row.x_frame), float(row.y_frame))
+    if "bl" in entry and "br" in entry:
+        _box_labels[int(fidx)] = entry
+n_heldout = len(_big_star_val_frames)
+print(f"Label-override dict built: {len(_box_labels)} frames with both bl+br labels.")
+print(f"  ({n_heldout} big_star validation frames held out — tracker must predict at those frames)")
+
+# %%
 if not video_path.exists():
     raise FileNotFoundError(f"Video not found: {video_path}")
 
@@ -352,12 +400,12 @@ results: dict[int, dict] = {SEED_FRAME: seed_result}
 # Forward pass: frames SEED_FRAME+1 … N-1 (sequential read).
 cap.set(cv2.CAP_PROP_POS_FRAMES, SEED_FRAME + 1)
 H_prev = H_seed
-for t in range(SEED_FRAME + 1, n_frames):
+for t in trange(SEED_FRAME + 1, n_frames):
     ok, frame = cap.read()
     if not ok:
         print(f"[WARN] Could not read frame {t}; stopping forward pass.")
         break
-    r, H_new = _process_frame(frame, t, H_prev)
+    r, H_new = _process_frame(frame, t, H_prev, _box_labels)
     results[t] = r
     if H_new is not None:
         H_prev = H_new
@@ -366,7 +414,7 @@ print(f"Forward pass complete ({SEED_FRAME+1}..{n_frames-1}).")
 
 # Backward pass: frames SEED_FRAME-1 … 0 (per-frame seeks).
 H_prev = H_seed
-for t in range(SEED_FRAME - 1, -1, -1):
+for t in trange(SEED_FRAME - 1, -1, -1):
     cap.set(cv2.CAP_PROP_POS_FRAMES, t)
     ok, frame = cap.read()
     if not ok:
@@ -375,7 +423,7 @@ for t in range(SEED_FRAME - 1, -1, -1):
         r["detection_reason"] = "read_failed"
         results[t] = r
         continue
-    r, H_new = _process_frame(frame, t, H_prev)
+    r, H_new = _process_frame(frame, t, H_prev, _box_labels)
     results[t] = r
     if H_new is not None:
         H_prev = H_new
@@ -479,6 +527,13 @@ for _, label_row in star_labels.iterrows():
 
 residuals_df = pd.DataFrame(residual_rows)
 
+# Tag each residual row: was the box position tracker-predicted or label-overridden?
+# Seed frame uses H_seed (built from labels), all others use tracker unless in _box_labels.
+if len(residuals_df) > 0:
+    residuals_df["box_override"] = residuals_df["frame_idx"].apply(
+        lambda f: (int(f) in _box_labels) or (int(f) == SEED_FRAME)
+    )
+
 # Attach big_star_residual_px to per_frame_df.
 per_frame_df["big_star_residual_px"] = _NAN
 if len(residuals_df) > 0:
@@ -534,8 +589,34 @@ if len(residuals_df) > 0:
     print(f"\nbig_star validation: N={len(residuals_df)}  "
           f"median={med:.2f} px  IQR=[{q1:.2f}, {q3:.2f}]  "
           f"max={residuals_df.residual_px.max():.2f}")
-    if med > 20:
-        print("  [FLAG] Median > 20 px — Phase-1c box corner detector has systematic bias.")
+
+    # Report tracker-only frames (the real metric) vs. override/seed frames.
+    if "box_override" in residuals_df.columns:
+        tracker_res = residuals_df[~residuals_df.box_override]
+        override_res = residuals_df[residuals_df.box_override]
+        if len(tracker_res) > 0:
+            tm = tracker_res.residual_px.median()
+            print(f"  tracker-only (N={len(tracker_res)}): median={tm:.2f} px  "
+                  f"max={tracker_res.residual_px.max():.2f}  "
+                  f">20px: {(tracker_res.residual_px > 20).sum()}/{len(tracker_res)}")
+        else:
+            print("  [WARN] No tracker-only big_star frames — all validation frames are overridden.")
+        if len(override_res) > 0:
+            print(f"  label-override/seed (N={len(override_res)}): "
+                  f"median={override_res.residual_px.median():.2f} px  "
+                  f"(measures screen-corner quality, not tracker)")
+
+    # Per-frame table for tracker-only frames.
+    if "box_override" in residuals_df.columns and len(tracker_res) > 0:
+        print(f"\n  {'frame':>7}  {'residual_px':>12}")
+        print("  " + "-" * 22)
+        for _, rr in tracker_res.sort_values("residual_px").iterrows():
+            flag = "  [FLAG]" if rr.residual_px > 20 else ""
+            print(f"  {int(rr.frame_idx):>7}  {rr.residual_px:>12.2f}{flag}")
+
+    tm_val = tracker_res.residual_px.median() if "box_override" in residuals_df.columns and len(tracker_res) > 0 else med
+    if tm_val > 20:
+        print("  [FLAG] Tracker-only median > 20 px — Phase-1c box corner detector has systematic bias.")
 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.hist(residuals_df.residual_px, bins=10, edgecolor="white", color="#4488ff")
@@ -548,7 +629,7 @@ if len(residuals_df) > 0:
         fontsize=10, y=0.97,
     )
     ax.legend()
-    hist_path = out_dir / "big_star_residual_hist.png"
+    hist_path = Path(out_residual_hist)
     fig.savefig(hist_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     print(f"Histogram saved → {hist_path}")
@@ -560,7 +641,7 @@ if len(residuals_df) > 0:
     ax2.set_ylabel("Residual (px)")
     ax2.set_title("Phase-1c big_star residual vs frame index")
     ax2.legend()
-    drift_path = out_dir / "big_star_residual_vs_frame.png"
+    drift_path = Path(out_residual_scatter)
     fig2.savefig(drift_path, dpi=120, bbox_inches="tight")
     plt.close(fig2)
     print(f"Drift plot saved → {drift_path}")
@@ -568,9 +649,60 @@ else:
     print("(no big_star residuals — skipping histogram)")
 
 # %% [markdown]
+# ## Trajectory plot
+
+# %%
+_traj_labels_bl = labels_df[labels_df.label_type == "box_bl"][["frame_idx", "y_frame"]]
+_traj_labels_br = labels_df[labels_df.label_type == "box_br"][["frame_idx", "y_frame"]]
+
+_snap_lo, _snap_hi = 750, 1200
+fig_t, (ax_full_t, ax_zoom_t) = plt.subplots(2, 1, figsize=(14, 8))
+for ax_t, xlim_t, title_t in [
+    (ax_full_t, None, "Box corner y-positions vs screen corner y-positions (full video)"),
+    (ax_zoom_t, (_snap_lo, _snap_hi), f"Zoomed: frames {_snap_lo}–{_snap_hi}"),
+]:
+    _sub = per_frame_df.copy()
+    if xlim_t:
+        _sub = _sub[(_sub.frame_idx >= xlim_t[0]) & (_sub.frame_idx <= xlim_t[1])]
+    _det = _sub[_sub.detection_status.isin(["detected", "interpolated", "extrapolated"])]
+    ax_t.plot(_det.frame_idx, _det.box_br_y, color="cyan", lw=0.8, alpha=0.8, label="box_br_y")
+    ax_t.plot(_det.frame_idx, _det.box_bl_y, color="magenta", lw=0.8, alpha=0.8, label="box_bl_y")
+    ax_t.plot(_sub.frame_idx, _sub.screen_bl_y, color="gold", lw=0.7, alpha=0.6, label="screen_bl_y")
+    ax_t.plot(_sub.frame_idx, _sub.screen_br_y, color="dodgerblue", lw=0.7, alpha=0.6, label="screen_br_y")
+    _lbl_sub = _traj_labels_bl if xlim_t is None else _traj_labels_bl[
+        (_traj_labels_bl.frame_idx >= xlim_t[0]) & (_traj_labels_bl.frame_idx <= xlim_t[1])]
+    _lbr_sub = _traj_labels_br if xlim_t is None else _traj_labels_br[
+        (_traj_labels_br.frame_idx >= xlim_t[0]) & (_traj_labels_br.frame_idx <= xlim_t[1])]
+    ax_t.scatter(_lbr_sub.frame_idx, _lbr_sub.y_frame, color="dodgerblue", marker="s", s=40, zorder=5, label="box_br label")
+    ax_t.scatter(_lbl_sub.frame_idx, _lbl_sub.y_frame, color="magenta", marker="s", s=40, zorder=5, label="box_bl label")
+    if xlim_t is None:
+        ax_t.axvspan(_snap_lo, _snap_hi, alpha=0.08, color="red")
+    ax_t.set_xlabel("frame_idx")
+    ax_t.set_ylabel("frame y-coordinate")
+    ax_t.set_title(title_t)
+    ax_t.legend(loc="upper right", fontsize=7, ncol=3 if xlim_t is None else 2)
+plt.tight_layout()
+traj_path = Path(out_trajectory)
+fig_t.savefig(traj_path, dpi=120, bbox_inches="tight")
+plt.close(fig_t)
+print(f"Trajectory plot saved → {traj_path}")
+
+# %% [markdown]
 # ## Spot-check overlays
 
 # %%
+# Auto-select: seed frame + top-8 worst-residual frames (or the caller-supplied list).
+if SPOT_CHECK_FRAMES:
+    _spot_frames = list(SPOT_CHECK_FRAMES)
+else:
+    _top_res = (
+        residuals_df.sort_values("residual_px", ascending=False).head(8).frame_idx.tolist()
+        if len(residuals_df) > 0 else []
+    )
+    _spot_frames = sorted(set([SEED_FRAME] + [int(f) for f in _top_res]))
+print(f"Spot-check frames: {_spot_frames}")
+
+
 def _draw_filled(img, xy, color, radius=7):
     cv2.circle(img, (int(round(xy[0])), int(round(xy[1]))), radius, color, -1, cv2.LINE_AA)
 
@@ -593,7 +725,7 @@ if not video_path.exists():
 else:
     cap_ov = cv2.VideoCapture(str(video_path))
 
-    for fidx in SPOT_CHECK_FRAMES:
+    for fidx in _spot_frames:
         cap_ov.set(cv2.CAP_PROP_POS_FRAMES, fidx)
         ok, frame = cap_ov.read()
         if not ok:
