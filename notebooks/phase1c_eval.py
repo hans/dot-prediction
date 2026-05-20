@@ -455,18 +455,26 @@ per_frame_df = (
 
 # %%
 _JUMP_THRESHOLD_PX = 25   # flag single-frame delta > this (unused below but documents intent)
-_DRIFT_PERSIST_PX  = 20   # flag frames deviating > this from pre-jump level
+_DRIFT_PERSIST_PX  = 60   # flag frames deviating > this from pre-jump level
+_DRIFT_REF_SPAN    = 2000  # only include preceding detections within this many frame indices
 
 _b3_det_mask = per_frame_df["detection_status"] == "detected"
 _b3_det_df   = per_frame_df.loc[_b3_det_mask, ["box_bl_x", "box_bl_y"]].copy()
+
+# Frames with box labels are ground truth — never flag them regardless of position
+_b3_box_labeled = set(int(f) for f in _box_labels_df.frame_idx.unique())
 
 flagged: set[int] = set()
 bl_y_vals = _b3_det_df["box_bl_y"].values
 bl_y_idx  = _b3_det_df.index.values
 
 for _i in range(50, len(bl_y_vals)):
+    cur_fidx = bl_y_idx[_i]
+    if cur_fidx in _b3_box_labeled:
+        continue  # ground-truth label — never flag
     pre = [bl_y_vals[_j] for _j in range(max(0, _i - 100), _i)
-           if bl_y_idx[_j] not in flagged]
+           if bl_y_idx[_j] not in flagged
+           and cur_fidx - bl_y_idx[_j] <= _DRIFT_REF_SPAN]
     if len(pre) < 10:
         continue
     ref = np.median(pre)
