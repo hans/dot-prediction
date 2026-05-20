@@ -445,6 +445,39 @@ per_frame_df = (
     .reset_index(drop=True)
 )
 
+# %% [markdown]
+# ## B3: temporal-jump rejection
+#
+# Flag detected frames where box_bl_y deviates > _DRIFT_PERSIST_PX from a
+# rolling median of the preceding 100 detected frames. Flagged frames are
+# marked "temporal_jump" so the interpolation pass treats them as non-detected
+# and fills them from neighboring good detections.
+
+# %%
+_JUMP_THRESHOLD_PX = 25   # flag single-frame delta > this (unused below but documents intent)
+_DRIFT_PERSIST_PX  = 20   # flag frames deviating > this from pre-jump level
+
+_b3_det_mask = per_frame_df["detection_status"] == "detected"
+_b3_det_df   = per_frame_df.loc[_b3_det_mask, ["box_bl_x", "box_bl_y"]].copy()
+
+flagged: set[int] = set()
+bl_y_vals = _b3_det_df["box_bl_y"].values
+bl_y_idx  = _b3_det_df.index.values
+
+for _i in range(50, len(bl_y_vals)):
+    pre = [bl_y_vals[_j] for _j in range(max(0, _i - 100), _i)
+           if bl_y_idx[_j] not in flagged]
+    if len(pre) < 10:
+        continue
+    ref = np.median(pre)
+    if abs(bl_y_vals[_i] - ref) > _DRIFT_PERSIST_PX:
+        flagged.add(bl_y_idx[_i])
+
+per_frame_df.loc[list(flagged), "detection_status"] = "temporal_jump"
+per_frame_df.loc[list(flagged), "detection_reason"] = "temporal_jump"
+print(f"B3: flagged {len(flagged)} frames as temporal_jump")
+
+# %%
 det_mask = per_frame_df.detection_status == "detected"
 no_screen_mask = per_frame_df.detection_status == "no_screen"
 need_fill = ~det_mask & ~no_screen_mask

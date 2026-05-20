@@ -1,18 +1,3 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python 3 (ipykernel)
-#     language: python
-#     name: python3
-# ---
-
 # %% [markdown]
 # # Hand-labeled homography correspondences
 #
@@ -85,6 +70,9 @@ frame_indices: list[int] = [
 
     # manually added based on trajectory results
     900, 4000, 7500, 26000, 5000, 5500, 5750,
+
+    17500, 17800, 18100, 18323,
+    29241, 13837, 10902, 12441
 ]
 
 # Candidate-picker knobs
