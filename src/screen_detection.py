@@ -16,6 +16,11 @@ _THRESH = 50
 # gaps from content elements like dots/stars).
 _CLOSE_K = 51
 
+# Morphological open kernel applied after the close, restricted to the BR
+# quadrant. Removes thin bright peninsulas (e.g. wrist illuminated by the
+# iPad) that extend the contour and pull the BR corner off the screen edge.
+_OPEN_K = 31
+
 
 def order_corners(pts: np.ndarray) -> np.ndarray:
     """Return corners in [TL, TR, BR, BL] order.
@@ -55,6 +60,15 @@ def detect_corners(frame: np.ndarray) -> np.ndarray | None:
     # Close to fill gaps within the screen content area
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (_CLOSE_K, _CLOSE_K))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    # Open in the BR quadrant only to strip thin wrist-illumination peninsulas
+    # without disturbing TL/TR/BL contour edges
+    h, w = binary.shape
+    ok = cv2.getStructuringElement(cv2.MORPH_RECT, (_OPEN_K, _OPEN_K))
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, ok)
+    br_mask = np.zeros_like(binary)
+    br_mask[h // 2:, w // 2:] = 255
+    binary = np.where(br_mask > 0, opened, binary)
 
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
