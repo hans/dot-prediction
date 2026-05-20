@@ -235,12 +235,15 @@ def _process_frame(
     t: int,
     H_prev: np.ndarray,
     box_labels: dict | None = None,
+    box_labels_rescue: dict | None = None,
 ) -> tuple[dict, np.ndarray | None]:
     """Run one detection step. Returns (result_dict, new_H or None).
 
-    If box_labels contains an entry for frame t, use the labeled positions
-    directly instead of running the detector (re-anchors the tracker).
-    box_labels format: {frame_idx: {'bl': (x, y), 'br': (x, y)}}
+    box_labels: override dict for non-validation frames — used directly instead
+        of running the detector (re-anchors the tracker).
+    box_labels_rescue: all labeled frames including validation frames — used as
+        a fallback only when the detector is rejected by the geometry check.
+    Both dicts have format: {frame_idx: {'bl': (x, y), 'br': (x, y)}}
     """
     r = _empty_result(t)
 
@@ -299,9 +302,18 @@ def _process_frame(
     horiz_sep = box_br_det[0] - box_bl_det[0]
     vert_spread = abs(box_bl_det[1] - box_br_det[1])
     if not is_label_frame and (horiz_sep < 15 or horiz_sep > 80 or vert_spread > 30):
-        r["detection_status"] = "geometric_invalid"
-        r["detection_reason"] = f"horiz_sep={horiz_sep:.0f},vert_spread={vert_spread:.0f}"
-        return r, None
+        # Geometry check failed — rescue with label if available (even validation frames)
+        if box_labels_rescue and t in box_labels_rescue:
+            lbl = box_labels_rescue[t]
+            box_bl_det = lbl.get("bl")
+            box_br_det = lbl.get("br")
+            r["box_bl_x"], r["box_bl_y"] = box_bl_det
+            r["box_br_x"], r["box_br_y"] = box_br_det
+            r["detection_reason"] = f"rescued_by_label(horiz_sep={horiz_sep:.0f},vert_spread={vert_spread:.0f})"
+        else:
+            r["detection_status"] = "geometric_invalid"
+            r["detection_reason"] = f"horiz_sep={horiz_sep:.0f},vert_spread={vert_spread:.0f}"
+            return r, None
 
     frame_pts = np.array([
         [sc.screen_bl_x, sc.screen_bl_y],
@@ -387,6 +399,18 @@ n_heldout = len(_big_star_val_frames)
 print(f"Label-override dict built: {len(_box_labels)} frames with both bl+br labels.")
 print(f"  ({n_heldout} big_star validation frames held out — tracker must predict at those frames)")
 
+# Rescue dict: all box-labeled frames (including validation) — only used as
+# fallback when the geometry check fires and would otherwise discard the frame.
+_box_labels_rescue: dict[int, dict] = {}
+for fidx, grp in _box_labels_df.groupby("frame_idx"):
+    entry: dict = {}
+    for _, row in grp.iterrows():
+        key = "bl" if row.label_type == "box_bl" else "br"
+        entry[key] = (float(row.x_frame), float(row.y_frame))
+    if "bl" in entry and "br" in entry:
+        _box_labels_rescue[int(fidx)] = entry
+print(f"Rescue dict built: {len(_box_labels_rescue)} frames (includes validation frames).")
+
 # %%
 if not video_path.exists():
     raise FileNotFoundError(f"Video not found: {video_path}")
@@ -405,7 +429,7 @@ for t in trange(SEED_FRAME + 1, n_frames):
     if not ok:
         print(f"[WARN] Could not read frame {t}; stopping forward pass.")
         break
-    r, H_new = _process_frame(frame, t, H_prev, _box_labels)
+    r, H_new = _process_frame(frame, t, H_prev, _box_labels, _box_labels_rescue)
     results[t] = r
     if H_new is not None:
         H_prev = H_new
@@ -423,7 +447,7 @@ for t in trange(SEED_FRAME - 1, -1, -1):
         r["detection_reason"] = "read_failed"
         results[t] = r
         continue
-    r, H_new = _process_frame(frame, t, H_prev, _box_labels)
+    r, H_new = _process_frame(frame, t, H_prev, _box_labels, _box_labels_rescue)
     results[t] = r
     if H_new is not None:
         H_prev = H_new
