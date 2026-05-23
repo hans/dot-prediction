@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from gaze_projection import (
@@ -10,10 +11,21 @@ from gaze_projection import (
     lerp_homography_at_frac,
     project_video_to_screen,
     screen_to_canvas,
+    smooth_homography_elements,
     tobii_ts_to_behavior_ms,
     tobii_ts_to_video_frame_frac,
 )
 from homography_solver import behavior_to_screen
+
+
+def _h_df(n_frames: int, base_value: float = 1.0) -> pd.DataFrame:
+    """Build a per-frame H dataframe with constant element values + h22=1.0."""
+    h_cols = ["h00", "h01", "h02", "h10", "h11", "h12", "h20", "h21"]
+    data = {"frame_idx": np.arange(n_frames)}
+    for c in h_cols:
+        data[c] = np.full(n_frames, base_value)
+    data["h22"] = np.full(n_frames, 1.0)
+    return pd.DataFrame(data)
 
 
 def test_tobii_ts_to_behavior_ms_linear() -> None:
@@ -157,6 +169,77 @@ def test_is_on_screen_y_boundary() -> None:
     sy = np.array([-1.0, 1668.0, 1669.0])
     out = is_on_screen(sx, sy)
     np.testing.assert_array_equal(out, [False, True, False])
+
+
+def test_smooth_homography_reduces_variance() -> None:
+    """Median of 5 iid Gaussians reduces variance by ~3-6x (asymptotic π/4n ≈ 0.157)."""
+    rng = np.random.default_rng(seed=42)
+    n = 100
+    df = _h_df(n, base_value=0.5)
+    sigma = 0.001
+    df["h00"] = 0.5 + rng.normal(0, sigma, n)
+    raw_std = df["h00"].std()
+    smoothed = smooth_homography_elements(df, window=5, min_valid=3)
+    # Drop the boundary NaNs that get pulled in if min_valid not satisfied.
+    smoothed_std = smoothed["h00"].dropna().std()
+    # Median-of-5 cuts variance by ~3-4x asymptotically (V(med of 5) ≈ 0.287 sigma²),
+    # but finite-sample noise on n=100 gives looser ratios. Assert at least 1.5x std
+    # reduction (~2.25x variance) — well above the noise floor.
+    assert smoothed_std < raw_std / 1.5, (
+        f"smoothed std {smoothed_std:.6f} not significantly lower than raw {raw_std:.6f}"
+    )
+
+
+def test_smooth_homography_fills_single_nan() -> None:
+    """A single NaN frame flanked by valid frames gets filled by the neighbors' median."""
+    df = _h_df(7, base_value=0.0)
+    df["h00"] = [1.0, 2.0, 3.0, np.nan, 5.0, 6.0, 7.0]
+    df.loc[3, [c for c in df.columns if c.startswith("h") and c != "h22"]] = np.nan
+    df.loc[3, "h22"] = 1.0  # keep h22 so the row isn't treated as a no_screen frame
+    smoothed = smooth_homography_elements(df, window=5, min_valid=3)
+    # Frame 3 window covers frames 1..5: original h00 values [2, 3, NaN, 5, 6]
+    # → non-NaN [2, 3, 5, 6] → median = 4.0.
+    np.testing.assert_allclose(smoothed.loc[3, "h00"], 4.0)
+
+
+def test_smooth_homography_boundaries_emit_with_min_valid() -> None:
+    """First/last frame: centered window=5 has 3 non-NaN values → still emits via min_valid=3."""
+    df = _h_df(10, base_value=1.0)
+    df["h00"] = np.arange(10, dtype=float)  # 0..9
+    smoothed = smooth_homography_elements(df, window=5, min_valid=3)
+    # Frame 0: window covers frames [-2,-1,0,1,2] → frames 0, 1, 2 → median([0,1,2]) = 1.0
+    np.testing.assert_allclose(smoothed.loc[0, "h00"], 1.0)
+    # Frame 9 (last): window covers frames [7,8,9,_,_] → median([7,8,9]) = 8.0
+    np.testing.assert_allclose(smoothed.loc[9, "h00"], 8.0)
+    # Interior: frame 5 → median([3,4,5,6,7]) = 5.0
+    np.testing.assert_allclose(smoothed.loc[5, "h00"], 5.0)
+
+
+def test_smooth_homography_preserves_h22_and_passthrough_cols() -> None:
+    df = _h_df(6, base_value=1.0)
+    df["frame_idx"] = np.arange(6)
+    df["detection_status"] = "detected"
+    smoothed = smooth_homography_elements(df, window=3, min_valid=2)
+    np.testing.assert_array_equal(smoothed["h22"].values, np.ones(6))
+    np.testing.assert_array_equal(smoothed["detection_status"].values,
+                                  np.array(["detected"] * 6))
+    np.testing.assert_array_equal(smoothed["frame_idx"].values, np.arange(6))
+
+
+def test_smooth_homography_nan_chain_too_long_produces_nan() -> None:
+    """3 consecutive NaN frames with min_valid=3, window=5 → middle frame can't be filled."""
+    df = _h_df(8, base_value=1.0)
+    df["h00"] = [1.0, 2.0, np.nan, np.nan, np.nan, 6.0, 7.0, 8.0]
+    # Also set the other h-cols and h22 to NaN for the NaN rows (no_screen pattern).
+    nan_rows = [2, 3, 4]
+    for c in ["h01", "h02", "h10", "h11", "h12", "h20", "h21", "h22"]:
+        df.loc[nan_rows, c] = np.nan
+    smoothed = smooth_homography_elements(df, window=5, min_valid=3)
+    # Frame 3: centered window covers frames 1..5 with values [2, NaN, NaN, NaN, 6] →
+    # only 2 non-NaN → below min_valid → NaN.
+    assert np.isnan(smoothed.loc[3, "h00"])
+    # h22 should also be NaN because non-normalized cols are NaN.
+    assert np.isnan(smoothed.loc[3, "h22"])
 
 
 if __name__ == "__main__":

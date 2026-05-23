@@ -64,6 +64,7 @@ from gaze_projection import (
     is_on_screen,
     project_video_to_screen,
     screen_to_canvas,
+    smooth_homography_elements,
     tobii_ts_to_behavior_ms,
     tobii_ts_to_video_frame_frac,
 )
@@ -90,15 +91,76 @@ intercept_ms = align["intercept_ms"]
 fps = align["fps"]
 print(f"Alignment: slope={slope_ms_per_s:.6f} ms/s  intercept={intercept_ms:.1f} ms  fps={fps:.6f}")
 
-per_frame_df = pd.read_parquet(phase1c_path)
+per_frame_raw = pd.read_parquet(phase1c_path)
 trials_df = pd.read_parquet(trials_path)
-print(f"Per-frame H: {len(per_frame_df)} rows  "
-      f"({(per_frame_df.detection_status == 'no_screen').sum()} no_screen)")
+print(f"Per-frame H: {len(per_frame_raw)} rows  "
+      f"({(per_frame_raw.detection_status == 'no_screen').sum()} no_screen)")
 print(f"Trials: {len(trials_df)} rows across {trials_df.trial_idx.nunique()} trials  "
       f"({trials_df.response_time.notna().sum()} with clicks)")
 
-# Build per-frame H tensor (N_frames, 3, 3). NaN-filled rows mark no_screen frames.
+# --- H-element temporal smoothing (Phase 2 preprocessing) ----------------
+# Phase 1c fits H independently per frame from 4 noisy correspondences
+# clustered near the screen bottom + photodiode device. Screen TR/TL are far
+# from any anchor → sub-pixel anchor jitter is amplified into huge perspective
+# swings: raw TR_x std ≈ 31k px, with sustained bad regimes ~30-40 frames
+# wide where the box-corner detector locks onto a feature ~10-15 px off.
+# A centered rolling-median smoother over a window WIDER than the bad regime
+# is needed to outvote the bad frames. Empirical sweep:
+#   window=5  → TR_x std 18.9k (only marginally better — bad regimes outvote)
+#   window=51 → TR_x std  1.7k (good; validation -25 px; ~2 s smoothing)
+#   window=101→ TR_x std  1.3k (overaggressive — 4 s of smoothing on a
+#                               head-mounted camera blurs real motion)
+# 51 is the smallest window that suppresses the sustained-regime explosions.
+H_SMOOTH_WINDOW = 51
+H_SMOOTH_MIN_VALID = 3
+
 _H_COLS = ["h00", "h01", "h02", "h10", "h11", "h12", "h20", "h21", "h22"]
+_h_std_before = per_frame_raw[_H_COLS].std()
+
+per_frame_df = smooth_homography_elements(
+    per_frame_raw, window=H_SMOOTH_WINDOW, min_valid=H_SMOOTH_MIN_VALID
+)
+_h_std_after = per_frame_df[_H_COLS].std()
+print(
+    f"\nH-element smoothing  (rolling median, window={H_SMOOTH_WINDOW}, "
+    f"min_valid={H_SMOOTH_MIN_VALID}):"
+)
+print(f"  {'col':<5}  {'std_before':>12}  {'std_after':>12}  {'ratio':>8}")
+for col in _H_COLS:
+    sb = float(_h_std_before[col])
+    sa = float(_h_std_after[col])
+    ratio = sa / sb if sb > 0 else float("nan")
+    print(f"  {col:<5}  {sb:>12.6g}  {sa:>12.6g}  {ratio:>8.2%}")
+
+# Diagnostic: project screen TR (2388, 0) under raw vs smoothed H — this is
+# the high-leverage corner where the polygon explosions were observed.
+def _project_corner(per_frame: pd.DataFrame, sx: float, sy: float) -> np.ndarray:
+    det = per_frame[per_frame.detection_status == "detected"]
+    pts = []
+    for _, r in det.iterrows():
+        if pd.isna(r.h00):
+            continue
+        v = np.array([r.h00, r.h01, r.h02]) * sx + np.array([0, 0, 0])
+        # row form: (H @ [sx, sy, 1])
+        vx = r.h00 * sx + r.h01 * sy + r.h02
+        vy = r.h10 * sx + r.h11 * sy + r.h12
+        vw = r.h20 * sx + r.h21 * sy + r.h22
+        pts.append((vx / vw, vy / vw))
+    return np.array(pts)
+
+
+_tr_raw = _project_corner(per_frame_raw, 2388.0, 0.0)
+_tr_smooth = _project_corner(per_frame_df, 2388.0, 0.0)
+print(
+    f"\nProjected screen-TR (2388, 0) across detected frames:"
+    f"\n  raw:      TR_x std={_tr_raw[:, 0].std():>10.1f}  "
+    f"min={_tr_raw[:, 0].min():>10.1f}  max={_tr_raw[:, 0].max():>10.1f}"
+    f"\n  smoothed: TR_x std={_tr_smooth[:, 0].std():>10.1f}  "
+    f"min={_tr_smooth[:, 0].min():>10.1f}  max={_tr_smooth[:, 0].max():>10.1f}"
+)
+
+# Build per-frame H tensor (N_frames, 3, 3). NaN-filled rows mark frames
+# where Phase 1c had no H OR where smoothing produced NaN at long gaps.
 N_FRAMES = int(per_frame_df.frame_idx.max()) + 1
 per_frame_h = np.full((N_FRAMES, 3, 3), np.nan)
 for _, r in per_frame_df.iterrows():
@@ -111,7 +173,7 @@ for _, r in per_frame_df.iterrows():
         [r.h20, r.h21, r.h22],
     ])
 n_valid_frames = (~np.isnan(per_frame_h).any(axis=(1, 2))).sum()
-print(f"Per-frame H tensor: {per_frame_h.shape}  ({n_valid_frames}/{N_FRAMES} frames have H)")
+print(f"\nPer-frame H tensor: {per_frame_h.shape}  ({n_valid_frames}/{N_FRAMES} frames have H)")
 
 # %%
 # Read only the Tobii TSV columns we need; the file is 200+ MB.

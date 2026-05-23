@@ -16,6 +16,51 @@ Tobii's built-in `Eye movement type`.
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
+
+
+_H_COLS_NON_NORMALIZED = ["h00", "h01", "h02", "h10", "h11", "h12", "h20", "h21"]
+
+
+def smooth_homography_elements(
+    per_frame_h: pd.DataFrame,
+    window: int = 5,
+    min_valid: int = 3,
+) -> pd.DataFrame:
+    """Centered rolling-median smoothing of H elements across frames.
+
+    Phase 1c's per-frame H is fit independently from 4 noisy correspondences
+    that are clustered near the screen bottom and the photodiode device. The
+    screen TR/TL corners are far from any anchor, so sub-pixel anchor jitter
+    is amplified into huge perspective-element swings (TR_x std measured in
+    the thousands of px). Smoothing h00..h21 with a centered rolling median
+    over `window` consecutive frames knocks the high-frequency jitter down
+    without lagging the polygon.
+
+    Args:
+        per_frame_h: DataFrame with `frame_idx` + h00..h22 columns. NaN-filled
+            h-rows mark frames where Phase 1c could not produce an H
+            (no_screen, geometric_invalid, …).
+        window: Centered rolling window size; default 5 frames.
+        min_valid: Minimum non-NaN values in window required to emit a
+            smoothed value (otherwise NaN).
+
+    Returns:
+        Copy of `per_frame_h` with h00..h21 replaced by smoothed values.
+        `h22` is set to 1.0 (perspective normalization preserved). All other
+        columns are passed through unchanged.
+    """
+    out = per_frame_h.sort_values("frame_idx").reset_index(drop=True).copy()
+    for col in _H_COLS_NON_NORMALIZED:
+        out[col] = (
+            out[col]
+            .rolling(window=window, min_periods=min_valid, center=True)
+            .median()
+        )
+    # h22 is the perspective-normalization element; Phase 1c always emits 1.0.
+    # Smoothing it would propagate NaN into otherwise-valid frames at boundaries.
+    out["h22"] = np.where(out[_H_COLS_NON_NORMALIZED].isna().any(axis=1), np.nan, 1.0)
+    return out
 
 
 def tobii_ts_to_behavior_ms(
