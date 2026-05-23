@@ -50,6 +50,8 @@ def subj(wc):
 rule all:
     input:
         expand("results/{subject}/eyetrack/screen_gaze_overlay.mp4", subject=SUBJECTS),
+        expand("results/{subject}/eyetrack/gaze_per_sample.parquet", subject=SUBJECTS),
+        expand("results/{subject}/eyetrack/fixation_events.parquet", subject=SUBJECTS),
 
 
 rule render_screen_gaze:
@@ -147,11 +149,49 @@ rule phase1c_homography:
         )
 
 
+rule extract_gaze_fixations:
+    input:
+        video=lambda wc: f"{subj(wc)['tobii_dir']}/{subj(wc)['scene_video']}",
+        tsv=lambda wc: f"{subj(wc)['tobii_dir']}/{subj(wc)['tobii_tsv']}",
+        phase1c=rules.phase1c_homography.output.per_frame,
+        align="results/{subject}/video_alignment.json",
+        trials="results/{subject}/trials_with_video.parquet",
+        notebook="notebooks/extract_gaze_fixations.py",
+    output:
+        per_sample="results/{subject}/eyetrack/gaze_per_sample.parquet",
+        fixation_events="results/{subject}/eyetrack/fixation_events.parquet",
+        coverage="results/{subject}/eyetrack/gaze_coverage_and_accuracy.png",
+        heatmap="results/{subject}/eyetrack/gaze_canvas_heatmap.png",
+        trajectories="results/{subject}/eyetrack/pre_click_gaze_trajectories.png",
+        psth="results/{subject}/eyetrack/saccade_psth_around_reveal.png",
+        overlay_mp4="results/{subject}/eyetrack/gaze_screen_overlay.mp4",
+        notebook="results/{subject}/notebooks/extract_gaze_fixations.ipynb",
+    params:
+        clip_start=config["clip_start_s"],
+        clip_duration=config["clip_duration_s"],
+    run:
+        canvas = config.get("behavior_canvas", {})
+        run_notebook(
+            input.notebook,
+            output.notebook,
+            parameters=dict(
+                subject=wildcards.subject,
+                video_path=input.video,
+                tsv_path=input.tsv,
+                phase1c_path=input.phase1c,
+                align_path=input.align,
+                trials_path=input.trials,
+                out_dir=str(Path(output.per_sample).parent),
+                URL_BAR_H_PX=canvas.get("url_bar_h_px", 272),
+                CANVAS_X_PAD_PX=canvas.get("x_pad_px", 233),
+                MAX_Y_COORD=canvas.get("max_y", 0.75),
+                CLIP_START_S=float(params.clip_start),
+                CLIP_DURATION_S=float(params.clip_duration),
+            ),
+        )
+
+
 # Future rules (not yet implemented):
-#
-# rule extract_gaze_fixations:
-#     Produce results/{subject}/eyetrack/gaze_fixations.parquet —
-#     per-frame screen-space gaze coordinates, for analysis notebooks.
 #
 # rule analyze_gaze_behavior:
 #     Run a notebook from notebooks/eyetrack/ relating fixation patterns
