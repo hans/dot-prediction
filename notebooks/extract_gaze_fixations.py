@@ -36,6 +36,9 @@ subject = "EC347"
 video_path = str(_ROOT / f"data/{subject}/tobii/scenevideo.mp4")
 tsv_path = str(_ROOT / f"data/{subject}/tobii/EC347_B16_tobii.tsv")
 phase1c_path = str(_ROOT / f"results/{subject}/phase1c_per_frame.parquet")
+calibration_path = str(
+    _ROOT / f"results/{subject}/homography_eval/homography_box_calibration.json"
+)
 align_path = str(_ROOT / f"results/{subject}/video_alignment.json")
 trials_path = str(_ROOT / f"results/{subject}/trials_with_video.parquet")
 out_dir = str(_ROOT / f"results/{subject}/eyetrack")
@@ -64,6 +67,7 @@ from gaze_projection import (
     is_on_screen,
     project_video_to_screen,
     screen_to_canvas,
+    smooth_anchors_then_refit,
     smooth_homography_elements,
     tobii_ts_to_behavior_ms,
     tobii_ts_to_video_frame_frac,
@@ -98,32 +102,54 @@ print(f"Per-frame H: {len(per_frame_raw)} rows  "
 print(f"Trials: {len(trials_df)} rows across {trials_df.trial_idx.nunique()} trials  "
       f"({trials_df.response_time.notna().sum()} with clicks)")
 
-# --- H-element temporal smoothing (Phase 2 preprocessing) ----------------
+# --- Anchor-refit H smoothing (Phase 2 preprocessing) --------------------
 # Phase 1c fits H independently per frame from 4 noisy correspondences
 # clustered near the screen bottom + photodiode device. Screen TR/TL are far
 # from any anchor → sub-pixel anchor jitter is amplified into huge perspective
-# swings: raw TR_x std ≈ 31k px, with sustained bad regimes ~30-40 frames
-# wide where the box-corner detector locks onto a feature ~10-15 px off.
-# A centered rolling-median smoother over a window WIDER than the bad regime
-# is needed to outvote the bad frames. Empirical sweep:
-#   window=5  → TR_x std 18.9k (only marginally better — bad regimes outvote)
-#   window=51 → TR_x std  1.7k (good; validation -25 px; ~2 s smoothing)
-#   window=101→ TR_x std  1.3k (overaggressive — 4 s of smoothing on a
-#                               head-mounted camera blurs real motion)
-# 51 is the smallest window that suppresses the sustained-regime explosions.
+# swings: raw TR_x std ≈ 31k px. Worse, the box-corner detector has two
+# stable detection regimes ('good' h00≈0.16; 'bad' h00≈-0.04 with box_bl_y
+# shifted ~13 px lower) that flip in sustained runs of 30–60 frames.
+#
+# A centered rolling-median over h00..h21 (issue #4 fix) knocks TR_x std down
+# 95% but still leaves visible polygon jumps at regime boundaries — smoothed
+# H matrices near regime transitions are algebraically inconsistent
+# (near-singular) and amplify badly at high-leverage corners.
+#
+# Issue #6 fix (Option A): smooth the 4 anchor positions in well-conditioned
+# pixel space, then re-fit a valid H per frame via cv2.findHomography. Same
+# 8 DOF of underlying state, but smoothing in the right space. The refit
+# always produces a topologically valid H — even when smoothed anchors are
+# stuck in the bad regime, the polygon mis-positions box corners by ~13 px
+# rather than blowing TR/TL across the frame.
 H_SMOOTH_WINDOW = 51
 H_SMOOTH_MIN_VALID = 3
+
+with open(calibration_path) as f:
+    _calib = json.load(f)
+box_bl_screen = tuple(_calib["box_bl_screen"])
+box_br_screen = tuple(_calib["box_br_screen"])
+print(
+    f"Box-anchor calibration loaded: "
+    f"box_bl_screen=({box_bl_screen[0]:.1f}, {box_bl_screen[1]:.1f})  "
+    f"box_br_screen=({box_br_screen[0]:.1f}, {box_br_screen[1]:.1f})"
+)
 
 _H_COLS = ["h00", "h01", "h02", "h10", "h11", "h12", "h20", "h21", "h22"]
 _h_std_before = per_frame_raw[_H_COLS].std()
 
-per_frame_df = smooth_homography_elements(
-    per_frame_raw, window=H_SMOOTH_WINDOW, min_valid=H_SMOOTH_MIN_VALID
+per_frame_df = smooth_anchors_then_refit(
+    per_frame_raw,
+    box_bl_screen=box_bl_screen,
+    box_br_screen=box_br_screen,
+    window=H_SMOOTH_WINDOW,
+    min_valid=H_SMOOTH_MIN_VALID,
+    screen_w_px=SCREEN_W_PX,
+    screen_h_px=SCREEN_H_PX,
 )
 _h_std_after = per_frame_df[_H_COLS].std()
 print(
-    f"\nH-element smoothing  (rolling median, window={H_SMOOTH_WINDOW}, "
-    f"min_valid={H_SMOOTH_MIN_VALID}):"
+    f"\nAnchor-refit H smoothing  (rolling median over anchor px, "
+    f"window={H_SMOOTH_WINDOW}, min_valid={H_SMOOTH_MIN_VALID}):"
 )
 print(f"  {'col':<5}  {'std_before':>12}  {'std_after':>12}  {'ratio':>8}")
 for col in _H_COLS:

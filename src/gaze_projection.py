@@ -15,11 +15,20 @@ Tobii's built-in `Eye movement type`.
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 import pandas as pd
 
 
 _H_COLS_NON_NORMALIZED = ["h00", "h01", "h02", "h10", "h11", "h12", "h20", "h21"]
+_H_COLS_ALL = _H_COLS_NON_NORMALIZED + ["h22"]
+
+_ANCHOR_FRAME_COLS = (
+    "screen_bl_x", "screen_bl_y",
+    "screen_br_x", "screen_br_y",
+    "box_bl_x", "box_bl_y",
+    "box_br_x", "box_br_y",
+)
 
 
 def smooth_homography_elements(
@@ -60,6 +69,124 @@ def smooth_homography_elements(
     # h22 is the perspective-normalization element; Phase 1c always emits 1.0.
     # Smoothing it would propagate NaN into otherwise-valid frames at boundaries.
     out["h22"] = np.where(out[_H_COLS_NON_NORMALIZED].isna().any(axis=1), np.nan, 1.0)
+    return out
+
+
+def smooth_anchors_then_refit(
+    per_frame_h: pd.DataFrame,
+    box_bl_screen: tuple[float, float],
+    box_br_screen: tuple[float, float],
+    window: int = 51,
+    min_valid: int = 3,
+    screen_w_px: int = 2388,
+    screen_h_px: int = 1668,
+) -> pd.DataFrame:
+    """Smooth per-frame anchor positions then refit H per frame.
+
+    Lower-DOF alternative to ``smooth_homography_elements``. Phase 1c fits H
+    from 4 frame-pixel anchors (screen_bl, screen_br, calibrated box_bl,
+    box_br). The box-corner detector has two stable detection regimes — a
+    'good' regime and a 'bad' regime shifted by ~13 px in y — that flip in
+    sustained runs of 30–60 contiguous frames. Smoothing the 8 H elements
+    independently produces algebraically invalid near-singular Hs near regime
+    boundaries that explode the polygon corners far from the anchor cluster
+    (TR/TL can swing by thousands of px).
+
+    Smoothing happens in pixel-anchor space (well-conditioned, bounded
+    coordinates) instead of H-element space, then ``cv2.findHomography``
+    re-derives a valid H from the smoothed anchors every frame. Even when the
+    smoothed anchor is biased into the bad regime, the refit produces a sane
+    H that mis-positions box corners by ~13 px rather than blowing up TR.
+
+    Args:
+        per_frame_h: DataFrame with the schema of
+            ``results/{subject}/phase1c_per_frame.parquet``. Must include
+            columns ``frame_idx``, ``screen_bl_x/y``, ``screen_br_x/y``,
+            ``box_bl_x/y``, ``box_br_x/y``, and ``h00..h22``.
+        box_bl_screen: Screen-pixel coordinates of the box-bl anchor (from
+            ``homography_box_calibration.json``).
+        box_br_screen: Screen-pixel coordinates of the box-br anchor.
+        window: Centered rolling-median window in frames. Default 51 matches
+            the H-element smoother's chosen value (the regime runs are 30–60
+            frames long, so the window must be wider than the longest regime
+            run to outvote bad frames).
+        min_valid: Minimum non-NaN values required in window to emit a
+            smoothed anchor (otherwise NaN; refit yields NaN H for the frame).
+        screen_w_px: iPad screen width in pixels (default 2388).
+        screen_h_px: iPad screen height in pixels (default 1668).
+
+    Returns:
+        Copy of ``per_frame_h`` with ``h00..h22`` replaced by the refit-from-
+        smoothed-anchors H per frame. Frames where any of the 8 smoothed
+        anchor values is NaN have all 9 h-columns set to NaN. The original
+        anchor columns and any other columns are passed through unchanged.
+    """
+    out = per_frame_h.sort_values("frame_idx").reset_index(drop=True).copy()
+
+    smoothed_anchors = {}
+    for col in _ANCHOR_FRAME_COLS:
+        if col not in out.columns:
+            raise KeyError(
+                f"smooth_anchors_then_refit: missing column {col!r} in per_frame_h"
+            )
+        smoothed_anchors[col] = (
+            out[col]
+            .rolling(window=window, min_periods=min_valid, center=True)
+            .median()
+            .to_numpy()
+        )
+
+    # Screen-coord side is fixed across frames.
+    screen_pts = np.array(
+        [
+            [0.0, float(screen_h_px)],                  # screen_bl
+            [float(screen_w_px), float(screen_h_px)],   # screen_br
+            [float(box_bl_screen[0]), float(box_bl_screen[1])],
+            [float(box_br_screen[0]), float(box_br_screen[1])],
+        ],
+        dtype=np.float64,
+    )
+
+    n = len(out)
+    h_out = np.full((n, 9), np.nan, dtype=np.float64)
+
+    bl_x = smoothed_anchors["screen_bl_x"]
+    bl_y = smoothed_anchors["screen_bl_y"]
+    br_x = smoothed_anchors["screen_br_x"]
+    br_y = smoothed_anchors["screen_br_y"]
+    box_bl_x = smoothed_anchors["box_bl_x"]
+    box_bl_y = smoothed_anchors["box_bl_y"]
+    box_br_x = smoothed_anchors["box_br_x"]
+    box_br_y = smoothed_anchors["box_br_y"]
+
+    any_nan = (
+        np.isnan(bl_x) | np.isnan(bl_y)
+        | np.isnan(br_x) | np.isnan(br_y)
+        | np.isnan(box_bl_x) | np.isnan(box_bl_y)
+        | np.isnan(box_br_x) | np.isnan(box_br_y)
+    )
+
+    for i in range(n):
+        if any_nan[i]:
+            continue
+        frame_pts = np.array(
+            [
+                [bl_x[i], bl_y[i]],
+                [br_x[i], br_y[i]],
+                [box_bl_x[i], box_bl_y[i]],
+                [box_br_x[i], box_br_y[i]],
+            ],
+            dtype=np.float64,
+        )
+        H_mat, _ = cv2.findHomography(screen_pts, frame_pts)
+        if H_mat is None:
+            continue
+        H_mat = H_mat / H_mat[2, 2]
+        h_out[i] = H_mat.reshape(9)
+
+    for j, col in enumerate(_H_COLS_ALL):
+        out[col] = h_out[:, j]
+
     return out
 
 
