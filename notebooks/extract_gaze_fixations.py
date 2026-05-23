@@ -162,16 +162,18 @@ H_per_sample = (1.0 - alpha) * h_lo + alpha * h_hi
 homography_valid = ~(np.isnan(h_lo).any(axis=(1, 2)) | np.isnan(h_hi).any(axis=(1, 2)))
 print(f"homography_valid: {homography_valid.mean():.1%}  ({homography_valid.sum()}/{len(homography_valid)})")
 
-# gaze_valid: Validity columns are "Valid"/"Invalid" strings in this Tobii export
-val_left = tobii_df["Validity left"].astype("string").values
-val_right = tobii_df["Validity right"].astype("string").values
-em_type_arr = tobii_df["Eye movement type"].astype("string").values
-gaze_valid = (
+# gaze_valid: Validity columns are "Valid"/"Invalid" strings in this Tobii export.
+# Cast to numpy bool ndarray explicitly (pandas string ops can return ArrowExtensionArray).
+val_left = tobii_df["Validity left"].astype(str).to_numpy()
+val_right = tobii_df["Validity right"].astype(str).to_numpy()
+em_type_arr = tobii_df["Eye movement type"].astype(str).to_numpy()
+gaze_valid = np.asarray(
     (val_left == "Valid")
     & (val_right == "Valid")
     & ~np.isnan(gx_video)
     & ~np.isnan(gy_video)
-    & (em_type_arr != "EyesNotFound")
+    & (em_type_arr != "EyesNotFound"),
+    dtype=bool,
 )
 print(f"gaze_valid:        {gaze_valid.mean():.1%}  ({gaze_valid.sum()}/{len(gaze_valid)})")
 
@@ -392,54 +394,60 @@ print(f"Saved gaze_coverage_and_accuracy.png")
 # ## Visualization 2 — canvas heatmap, 3 phases
 
 # %%
-# Phase assignment per gaze sample: pre-reveal / reveal→click / post-click.
-# Iterate trials in trial_idx order; reveal_time and response_time are behavior-ms.
-# - pre-reveal: samples BEFORE the first reveal of each trial (trial onset, tpt=0)
-# - reveal→click: between reveal and click of the SAME tpt (clicks only)
-# - post-click: after each click, before the next reveal in that trial OR
-#               before the next trial's first reveal
+# Phase assignment per gaze sample: pre-reveal / reveal-to-click / post-click.
+#
+# Trial timing (verified from trials_with_video.parquet):
+#   tpt=0,1,2: auto-reveals (response_time NaN; system shows the pattern)
+#   tpt=3,4,...: user clicks where they predict next, THEN system reveals.
+#     response_time[N] < reveal_time[N] always — the click PREDICTS where the
+#     dot at tpt=N will appear; reveal confirms.
+#
+# Physically meaningful phases:
+#   pre-reveal: before the trial's first auto-reveal (the pattern hasn't started)
+#   reveal-to-click: from reveal_time[N] to the next prediction click — user is
+#     examining the revealed dot in preparation for predicting tpt=N+1.
+#   post-click: from response_time[N] to reveal_time[N] — user has clicked
+#     their prediction; system is about to confirm.
 
 phase_of_sample = np.full(len(gaze_per_sample), "", dtype=object)
 beh_t = gaze_per_sample.behavior_t_ms.values
 
-# Sort trials by reveal_time so we can assign phases in temporal order.
 all_trial_events = trials_df.sort_values(["trial_idx", "tpt"]).reset_index(drop=True)
-trial_starts = (
-    all_trial_events.groupby("trial_idx")["reveal_time"].min().sort_values()
-)
-# pre-reveal: samples between previous-trial's last event and this trial's first reveal
+
+# pre-reveal: before each trial's first reveal_time (clipped to previous trial's last event).
+trial_first_reveal = all_trial_events.groupby("trial_idx")["reveal_time"].min().sort_values()
+trial_last_event = all_trial_events.groupby("trial_idx")[["reveal_time", "response_time"]].max().max(axis=1)
 prev_end = 0.0
-for tidx in trial_starts.index:
-    first_reveal = float(trial_starts[tidx])
+for tidx in trial_first_reveal.index:
+    first_reveal = float(trial_first_reveal[tidx])
     mask = (beh_t >= prev_end) & (beh_t < first_reveal)
     phase_of_sample[mask] = "pre-reveal"
-    # Mark end of this trial as max event time
-    trial_evts = all_trial_events[all_trial_events.trial_idx == tidx]
-    prev_end = float(trial_evts[["reveal_time", "response_time"]].max().max())
+    prev_end = float(trial_last_event[tidx])
 
-# reveal→click for each tpt with a click; post-click between click and next reveal
-for _, row in all_trial_events.iterrows():
-    rev = float(row.reveal_time) if pd.notna(row.reveal_time) else None
-    cli = float(row.response_time) if pd.notna(row.response_time) else None
-    if rev is None or cli is None:
-        continue
-    if cli <= rev:
-        continue
-    mask = (beh_t >= rev) & (beh_t <= cli)
-    phase_of_sample[mask] = "reveal-to-click"
+# Within-trial windows: walk events in time order and bracket the gaps.
+for tidx, group in all_trial_events.groupby("trial_idx"):
+    # Stack events: each tpt contributes (reveal_time) and (response_time if not NaN)
+    # in time order.
+    events = []
+    for _, row in group.iterrows():
+        events.append(("reveal", float(row.reveal_time), int(row.tpt)))
+        if pd.notna(row.response_time):
+            events.append(("click", float(row.response_time), int(row.tpt)))
+    events.sort(key=lambda x: x[1])
 
-    # post-click: from click to next event (next tpt reveal in the same trial,
-    # or the next trial's first reveal).
-    next_evts = all_trial_events[
-        (all_trial_events.trial_idx > row.trial_idx)
-        | ((all_trial_events.trial_idx == row.trial_idx) & (all_trial_events.tpt > row.tpt))
-    ]
-    if len(next_evts) > 0:
-        next_t = float(next_evts.reveal_time.dropna().min())
-    else:
-        next_t = float(gaze_per_sample.behavior_t_ms.max())
-    mask = (beh_t > cli) & (beh_t < next_t)
-    phase_of_sample[mask] = "post-click"
+    for i in range(len(events) - 1):
+        kind, t0, _ = events[i]
+        next_kind, t1, _ = events[i + 1]
+        mask = (beh_t > t0) & (beh_t <= t1)
+        if kind == "reveal" and next_kind == "click":
+            phase_of_sample[mask] = "reveal-to-click"
+        elif kind == "click" and next_kind == "reveal":
+            phase_of_sample[mask] = "post-click"
+        elif kind == "reveal" and next_kind == "reveal":
+            # Two consecutive auto-reveals (tpt 0→1, 1→2 etc.) — treat as
+            # reveal-to-click for heatmap purposes (user is examining the
+            # dot just shown).
+            phase_of_sample[mask] = "reveal-to-click"
 
 phase_counts = pd.Series(phase_of_sample).value_counts(dropna=False)
 print("\nSample counts by phase:")
@@ -577,7 +585,7 @@ for j in range(n_sub, len(axes_flat)):
 
 fig3.suptitle(
     f"Pre-click gaze trajectories (random {n_sub} clicks, seed=0)\n"
-    "gold = true dot, blue×= click, dots = gaze t=-1s (blue) → t=0 (yellow)",
+    "gold = true dot, blue× = click, gaze viridis t=-1s (purple) → t=0 (yellow)",
     fontsize=11, y=1.0,
 )
 plt.tight_layout()
