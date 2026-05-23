@@ -6,16 +6,84 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import cv2
+
 from gaze_projection import (
     is_on_screen,
     lerp_homography_at_frac,
     project_video_to_screen,
     screen_to_canvas,
+    smooth_anchors_then_refit,
     smooth_homography_elements,
     tobii_ts_to_behavior_ms,
     tobii_ts_to_video_frame_frac,
 )
 from homography_solver import behavior_to_screen
+
+
+# --- shared scaffolding for smooth_anchors_then_refit tests ----------------
+
+SCREEN_W = 2388
+SCREEN_H = 1668
+BOX_BL_SCREEN = (1850.0, 1620.0)   # arbitrary but representative
+BOX_BR_SCREEN = (2200.0, 1620.0)
+_ANCHOR_COLS = (
+    "screen_bl_x", "screen_bl_y",
+    "screen_br_x", "screen_br_y",
+    "box_bl_x", "box_bl_y",
+    "box_br_x", "box_br_y",
+)
+
+
+def _project(H: np.ndarray, sx: float, sy: float) -> tuple[float, float]:
+    v = H @ np.array([sx, sy, 1.0])
+    return float(v[0] / v[2]), float(v[1] / v[2])
+
+
+def _anchor_frame_pts(H_screen_to_frame: np.ndarray) -> dict[str, float]:
+    """Project the 4 screen-coord anchors through H to get frame anchors."""
+    bl = _project(H_screen_to_frame, 0.0, SCREEN_H)
+    br = _project(H_screen_to_frame, float(SCREEN_W), SCREEN_H)
+    box_bl = _project(H_screen_to_frame, *BOX_BL_SCREEN)
+    box_br = _project(H_screen_to_frame, *BOX_BR_SCREEN)
+    return {
+        "screen_bl_x": bl[0], "screen_bl_y": bl[1],
+        "screen_br_x": br[0], "screen_br_y": br[1],
+        "box_bl_x": box_bl[0], "box_bl_y": box_bl[1],
+        "box_br_x": box_br[0], "box_br_y": box_br[1],
+    }
+
+
+def _ground_truth_H() -> np.ndarray:
+    """A plausible iPad-screen → camera-frame homography."""
+    return np.array(
+        [
+            [0.16, -0.005, 1100.0],
+            [0.001,  0.16,  300.0],
+            [-1.5e-5, -1.0e-6, 1.0],
+        ]
+    )
+
+
+def _build_anchor_df(
+    H_per_frame: np.ndarray,
+    h_cols_fill: float | None = 0.0,
+) -> pd.DataFrame:
+    """Build a per-frame H DataFrame whose anchor columns are derived from H.
+
+    Used as a synthetic stand-in for ``phase1c_per_frame.parquet``. The h-cols
+    are populated with placeholder values (default 0.0) so the input has the
+    full schema — they'll get overwritten by the refit.
+    """
+    n = H_per_frame.shape[0]
+    rows = []
+    for i in range(n):
+        pts = _anchor_frame_pts(H_per_frame[i])
+        row = {"frame_idx": i, **pts}
+        for col in ["h00", "h01", "h02", "h10", "h11", "h12", "h20", "h21", "h22"]:
+            row[col] = h_cols_fill
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _h_df(n_frames: int, base_value: float = 1.0) -> pd.DataFrame:
@@ -240,6 +308,242 @@ def test_smooth_homography_nan_chain_too_long_produces_nan() -> None:
     assert np.isnan(smoothed.loc[3, "h00"])
     # h22 should also be NaN because non-normalized cols are NaN.
     assert np.isnan(smoothed.loc[3, "h22"])
+
+
+# --- smooth_anchors_then_refit ---------------------------------------------
+
+
+def test_smooth_anchors_then_refit_noiseless_roundtrip() -> None:
+    """No noise → smoothed anchors == raw anchors → refit recovers H exactly."""
+    H_true = _ground_truth_H()
+    n = 60
+    H_per_frame = np.broadcast_to(H_true, (n, 3, 3)).copy()
+    df = _build_anchor_df(H_per_frame)
+
+    out = smooth_anchors_then_refit(
+        df,
+        box_bl_screen=BOX_BL_SCREEN,
+        box_br_screen=BOX_BR_SCREEN,
+        window=11,
+        min_valid=3,
+        screen_w_px=SCREEN_W,
+        screen_h_px=SCREEN_H,
+    )
+
+    interior = out.iloc[10:50]  # avoid window boundaries
+    assert not interior[["h00", "h01", "h02", "h10", "h11", "h12", "h20", "h21", "h22"]].isna().any().any()
+
+    # Compare projected screen-TR across frames — should match the truth.
+    # atol allows for cv2.findHomography's DLT numerical precision (~0.1 px on
+    # noiseless 4-point inputs); negligible compared to the ~334 px validation
+    # gate.
+    truth_tr = _project(H_true, float(SCREEN_W), 0.0)
+    for _, r in interior.iterrows():
+        H = np.array(
+            [[r.h00, r.h01, r.h02], [r.h10, r.h11, r.h12], [r.h20, r.h21, r.h22]]
+        )
+        tr = _project(H, float(SCREEN_W), 0.0)
+        np.testing.assert_allclose(tr, truth_tr, atol=1.0)
+
+
+def test_smooth_anchors_then_refit_reduces_tr_variance_under_noise() -> None:
+    """IID Gaussian anchor noise → smoothed-refit TR std < raw-fit TR std."""
+    rng = np.random.default_rng(seed=0)
+    H_true = _ground_truth_H()
+    n = 200
+    sigma = 2.0  # pixels of anchor noise (matches reported anchor jitter)
+
+    rows: list[dict] = []
+    raw_tr = np.zeros((n, 2))
+    truth_pts = _anchor_frame_pts(H_true)
+    screen_pts_ref = np.array(
+        [
+            [0.0, float(SCREEN_H)],
+            [float(SCREEN_W), float(SCREEN_H)],
+            list(BOX_BL_SCREEN),
+            list(BOX_BR_SCREEN),
+        ],
+        dtype=np.float64,
+    )
+
+    for i in range(n):
+        noisy = {k: v + rng.normal(0, sigma) for k, v in truth_pts.items()}
+        row = {"frame_idx": i, **noisy}
+        # Compute the raw per-frame H for comparison and stash h-cols.
+        frame_pts = np.array(
+            [
+                [noisy["screen_bl_x"], noisy["screen_bl_y"]],
+                [noisy["screen_br_x"], noisy["screen_br_y"]],
+                [noisy["box_bl_x"], noisy["box_bl_y"]],
+                [noisy["box_br_x"], noisy["box_br_y"]],
+            ],
+            dtype=np.float64,
+        )
+        H_raw, _ = cv2.findHomography(screen_pts_ref, frame_pts)
+        H_raw = H_raw / H_raw[2, 2]
+        raw_tr[i] = _project(H_raw, float(SCREEN_W), 0.0)
+        for j, col in enumerate(["h00", "h01", "h02", "h10", "h11", "h12", "h20", "h21", "h22"]):
+            row[col] = float(H_raw.reshape(9)[j])
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    out = smooth_anchors_then_refit(
+        df,
+        box_bl_screen=BOX_BL_SCREEN,
+        box_br_screen=BOX_BR_SCREEN,
+        window=51,
+        min_valid=3,
+        screen_w_px=SCREEN_W,
+        screen_h_px=SCREEN_H,
+    )
+
+    interior = out.iloc[30:170]
+    smoothed_tr_x = np.array([
+        _project(
+            np.array([[r.h00, r.h01, r.h02], [r.h10, r.h11, r.h12], [r.h20, r.h21, r.h22]]),
+            float(SCREEN_W), 0.0,
+        )[0]
+        for _, r in interior.iterrows()
+    ])
+    raw_tr_x = raw_tr[30:170, 0]
+
+    # Smoothing must visibly reduce TR-x variance (>= 2×).
+    assert smoothed_tr_x.std() < raw_tr_x.std() / 2.0, (
+        f"smoothed TR_x std={smoothed_tr_x.std():.2f} not < half of raw {raw_tr_x.std():.2f}"
+    )
+
+
+def test_smooth_anchors_then_refit_bounded_under_regime_flip() -> None:
+    """Sustained 50-frame anchor-y jump → refit TR stays bounded.
+
+    Simulates the Phase 1c detector regime flip: box anchors shift by 13 px in
+    y for a run of 50 consecutive frames. The H-element smoother is known to
+    produce TR explosions of thousands of px at the regime boundary. The
+    anchor-refit smoother's TR should stay bounded by something close to the
+    H-derived projection of a 13-px box-anchor shift — i.e. comparable in
+    magnitude to the anchor shift itself, far below the H-element disaster.
+    """
+    H_true = _ground_truth_H()
+    n = 200
+    regime_start, regime_end = 75, 125
+
+    # No frame-to-frame noise — isolate the regime-shift effect.
+    rows: list[dict] = []
+    screen_pts_ref = np.array(
+        [
+            [0.0, float(SCREEN_H)],
+            [float(SCREEN_W), float(SCREEN_H)],
+            list(BOX_BL_SCREEN),
+            list(BOX_BR_SCREEN),
+        ],
+        dtype=np.float64,
+    )
+
+    truth_pts = _anchor_frame_pts(H_true)
+    raw_tr_x = np.zeros(n)
+    for i in range(n):
+        pts = dict(truth_pts)
+        if regime_start <= i < regime_end:
+            pts["box_bl_y"] = pts["box_bl_y"] + 13.0
+            pts["box_br_y"] = pts["box_br_y"] + 13.0
+        row = {"frame_idx": i, **pts}
+        frame_pts = np.array(
+            [
+                [pts["screen_bl_x"], pts["screen_bl_y"]],
+                [pts["screen_br_x"], pts["screen_br_y"]],
+                [pts["box_bl_x"], pts["box_bl_y"]],
+                [pts["box_br_x"], pts["box_br_y"]],
+            ],
+            dtype=np.float64,
+        )
+        H_raw, _ = cv2.findHomography(screen_pts_ref, frame_pts)
+        H_raw = H_raw / H_raw[2, 2]
+        raw_tr_x[i] = _project(H_raw, float(SCREEN_W), 0.0)[0]
+        for j, col in enumerate(["h00", "h01", "h02", "h10", "h11", "h12", "h20", "h21", "h22"]):
+            row[col] = float(H_raw.reshape(9)[j])
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    out = smooth_anchors_then_refit(
+        df,
+        box_bl_screen=BOX_BL_SCREEN,
+        box_br_screen=BOX_BR_SCREEN,
+        window=51,
+        min_valid=3,
+        screen_w_px=SCREEN_W,
+        screen_h_px=SCREEN_H,
+    )
+
+    # Range of TR-x across all frames in the smoothed result should be tightly
+    # bounded — anchor jump is 13 px so TR projection shouldn't move by more
+    # than O(few × 13 px) given the leverage from the photodiode anchors to TR.
+    smoothed_tr_x = np.array([
+        _project(
+            np.array([[r.h00, r.h01, r.h02], [r.h10, r.h11, r.h12], [r.h20, r.h21, r.h22]]),
+            float(SCREEN_W), 0.0,
+        )[0]
+        for _, r in out.iterrows()
+        if not np.isnan(r.h00)
+    ])
+    tr_range = float(smoothed_tr_x.max() - smoothed_tr_x.min())
+    # Sanity: TR jitter from a 13-px box-anchor regime shift should remain
+    # well below 500 px. The H-element smoothed version on the same simulated
+    # data routinely exceeds 1000+ px at regime transitions.
+    assert tr_range < 500.0, (
+        f"smoothed-refit TR_x range across regime flip = {tr_range:.1f} px (expected < 500)"
+    )
+
+
+def test_smooth_anchors_then_refit_propagates_nan() -> None:
+    """A long enough NaN gap in any anchor column → output H is NaN at that frame."""
+    H_true = _ground_truth_H()
+    n = 20
+    H_per_frame = np.broadcast_to(H_true, (n, 3, 3)).copy()
+    df = _build_anchor_df(H_per_frame)
+
+    # Knock out box_bl_x for 5 consecutive frames; min_valid=3 with window=3 →
+    # center NaN frame has 0 non-NaN, smoothed value stays NaN → refit fails.
+    df.loc[8:12, "box_bl_x"] = np.nan
+    df.loc[8:12, "box_bl_y"] = np.nan
+
+    out = smooth_anchors_then_refit(
+        df,
+        box_bl_screen=BOX_BL_SCREEN,
+        box_br_screen=BOX_BR_SCREEN,
+        window=3,
+        min_valid=2,
+        screen_w_px=SCREEN_W,
+        screen_h_px=SCREEN_H,
+    )
+
+    # Center frame of the NaN gap: definitely NaN (no non-NaN values in window).
+    for col in ["h00", "h11", "h22"]:
+        assert np.isnan(out.loc[10, col]), f"expected NaN for {col} at frame 10"
+
+    # Frames well outside the NaN window should be valid.
+    for col in ["h00", "h11", "h22"]:
+        assert not np.isnan(out.loc[5, col])
+
+
+def test_smooth_anchors_then_refit_passes_through_extra_columns() -> None:
+    H_true = _ground_truth_H()
+    n = 10
+    H_per_frame = np.broadcast_to(H_true, (n, 3, 3)).copy()
+    df = _build_anchor_df(H_per_frame)
+    df["detection_status"] = "detected"
+    df["detection_reason"] = ""
+
+    out = smooth_anchors_then_refit(
+        df,
+        box_bl_screen=BOX_BL_SCREEN,
+        box_br_screen=BOX_BR_SCREEN,
+        window=3,
+        min_valid=2,
+    )
+    np.testing.assert_array_equal(
+        out["detection_status"].values, np.array(["detected"] * n)
+    )
+    np.testing.assert_array_equal(out["frame_idx"].values, np.arange(n))
 
 
 if __name__ == "__main__":
