@@ -47,6 +47,58 @@ def subj(wc):
     return config["subjects"][wc.subject]
 
 
+# ---------------------------------------------------------------------------
+# Manual prerequisites — rules that gate on files produced by interactive
+# notebooks.  If the output files already exist these rules are never run.
+# If they are missing, Snakemake runs the rule body, which prints instructions
+# and exits 1 so the pipeline cannot proceed.
+# ---------------------------------------------------------------------------
+
+rule align_video:
+    """Sync Tobii video frames to behavior timestamps (interactive notebook)."""
+    output:
+        alignment="results/{subject}/video_alignment.json",
+        trials="results/{subject}/trials_with_video.parquet",
+    shell:
+        """
+        echo ""
+        echo "MANUAL STEP REQUIRED: video <-> behavior alignment"
+        echo ""
+        echo "  Open notebooks/align_video.py as a Jupyter notebook and follow"
+        echo "  the interactive anchor-picker workflow. It will write:"
+        echo ""
+        echo "    results/{wildcards.subject}/video_alignment.json"
+        echo "    results/{wildcards.subject}/trials_with_video.parquet"
+        echo ""
+        echo "  Then re-run snakemake."
+        echo ""
+        exit 1
+        """
+
+
+rule label_homography:
+    """Hand-label iPad corners and box corners on ~25 frames (interactive notebook)."""
+    input:
+        alignment=rules.align_video.output.alignment,
+        trials=rules.align_video.output.trials,
+    output:
+        "results/{subject}/homography_labels.parquet",
+    shell:
+        """
+        echo ""
+        echo "MANUAL STEP REQUIRED: hand-label homography correspondences"
+        echo ""
+        echo "  Open notebooks/label_homography_correspondences.py as a Jupyter"
+        echo "  notebook and label the pre-selected frames. It will write:"
+        echo ""
+        echo "    results/{wildcards.subject}/homography_labels.parquet"
+        echo ""
+        echo "  Then re-run snakemake."
+        echo ""
+        exit 1
+        """
+
+
 rule all:
     input:
         expand("results/{subject}/eyetrack/screen_gaze_overlay.mp4", subject=SUBJECTS),
