@@ -8,7 +8,7 @@ import pytest
 
 import cv2
 
-from gaze_projection import (
+from src.gaze_projection import (
     is_on_screen,
     lerp_homography_at_frac,
     project_video_to_screen,
@@ -18,7 +18,7 @@ from gaze_projection import (
     tobii_ts_to_behavior_ms,
     tobii_ts_to_video_frame_frac,
 )
-from homography_solver import behavior_to_screen
+from src.homography_solver import behavior_to_screen
 
 
 # --- shared scaffolding for smooth_anchors_then_refit tests ----------------
