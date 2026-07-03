@@ -80,24 +80,35 @@ dot, especially for dots revealed near the top of the canvas (where the PR's
 
 ## 4. Run the comparison notebook
 
+`compare_branches.py` is a jupytext percent-format notebook. Run it with
+ploomber_engine (the same runner used by the Snakefile):
+
 ```bash
-# From the main worktree, with both pipelines complete:
-uv run jupyter nbconvert --to notebook --execute \
-    notebooks/compare_branches.py \
-    --output results/EC347/comparison/compare_branches.ipynb \
-    --ExecutePreprocessor.timeout=120
+uv run python - <<'EOF'
+from ploomber_engine import execute_notebook
+import jupytext, tempfile
+from pathlib import Path
+
+nb = jupytext.read("notebooks/compare_branches.py")
+with tempfile.NamedTemporaryFile(suffix=".ipynb", delete=False) as f:
+    tmp = Path(f.name)
+jupytext.write(nb, tmp)
+
+execute_notebook(str(tmp), "results/EC347/comparison/compare_branches.ipynb",
+    parameters=dict(
+        dir_a="/path/to/dot-prediction/results/EC347",
+        label_a="main",
+        dir_b="/path/to/dot-prediction-bigstar/results/EC347",
+        label_b="feat/issue-8",
+        trials_path="/path/to/dot-prediction/results/EC347/trials_with_video.parquet",
+        out_dir="/path/to/dot-prediction/results/EC347/comparison",
+    ))
+tmp.unlink()
+EOF
 ```
 
-Or run it interactively with parameters set to:
-
-```python
-dir_a = "/path/to/dot-prediction/results/EC347"          # main
-label_a = "main"
-dir_b = "/path/to/dot-prediction-bigstar/results/EC347"  # PR #9
-label_b = "feat/issue-8"
-trials_path = "/path/to/dot-prediction/results/EC347/trials_with_video.parquet"
-out_dir = "/path/to/dot-prediction/results/EC347/comparison"
-```
+Or open `notebooks/compare_branches.py` directly in Jupyter (jupytext will
+pair it as a notebook) and edit the `parameters` cell before running.
 
 ---
 
