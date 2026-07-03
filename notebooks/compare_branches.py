@@ -336,3 +336,127 @@ else:
     print("Saved canvas_shift.png")
 
 print(f"\nAll outputs written to {out_dir}/")
+
+# %%
+# ---------------------------------------------------------------------------
+# Visual comparison HTML — pipeline-generated PNGs side by side
+# ---------------------------------------------------------------------------
+
+import base64
+
+PIPELINE_IMAGES = [
+    (
+        "cascade_trajectory.png",
+        "Corner tracking trajectory",
+        "Box-corner and screen-corner Y positions vs frame index. "
+        "Look for fewer sudden jumps in the right column (PR branch). "
+        "Persistent drift or spikes in the left column are what the PR targets.",
+    ),
+    (
+        "big_star_residual_hist.png",
+        "big_star residual histogram",
+        "Distribution of 4-anchor-only H reprojection error at 19 hand-labeled "
+        "big_star frames. Both branches use the same 4-anchor refit here, so "
+        "this is a sanity check that the PR didn't disturb box-corner calibration. "
+        "Distributions should look similar.",
+    ),
+    (
+        "big_star_residual_vs_frame.png",
+        "big_star residual vs frame",
+        "Same residuals plotted over time. Outlier frames that are high in both "
+        "branches indicate genuinely hard frames; outliers only in main suggest "
+        "the PR fixed a specific bad-regime interval.",
+    ),
+    (
+        str(Path("eyetrack") / "gaze_coverage_and_accuracy.png"),
+        "Gaze coverage and pre-click accuracy",
+        "Left panel: homography_valid and on_screen rates over time in 10 s bins — "
+        "PR should be equal or higher throughout. "
+        "Right panel: pre-click gaze distance to target; PR acceptance gate is "
+        "median < 250 canvas px (red line). Compare medians and tail shape.",
+    ),
+    (
+        str(Path("eyetrack") / "pre_click_gaze_trajectories.png"),
+        "Pre-click gaze trajectories",
+        "20 sampled click events. Each panel: canvas with revealed dots, target "
+        "(gold), gaze trajectory in the 1 s before click (purple→yellow), click "
+        "location (blue ×). Look for tighter trajectories around the target dot "
+        "in the PR branch, especially for dots near the top of the canvas.",
+    ),
+    (
+        str(Path("eyetrack") / "gaze_canvas_heatmap.png"),
+        "Gaze canvas heatmap",
+        "Log-scaled fixation density by trial phase (pre-reveal / reveal-to-click "
+        "/ post-click). Overall layout should be similar; differences indicate "
+        "gaze positions shifted by the new H. Hot spots near the top edge are "
+        "most sensitive to the TR/TL conditioning fix.",
+    ),
+    (
+        str(Path("eyetrack") / "saccade_psth_around_reveal.png"),
+        "Saccade PSTH around reveal",
+        "Saccade-onset times relative to dot-reveal events (±2 s). "
+        "Should look similar between branches — this is a downstream neural "
+        "signal and large differences would warrant investigation.",
+    ),
+]
+
+
+def _b64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+
+def _img_tag(path):
+    if not Path(path).exists():
+        return f'<div class="missing">image not found: {path}</div>'
+    ext = Path(path).suffix.lstrip(".")
+    mime = "jpeg" if ext in ("jpg", "jpeg") else "png"
+    return f'<img src="data:image/{mime};base64,{_b64(path)}" />'
+
+
+rows_html = []
+for rel_path, title, instructions in PIPELINE_IMAGES:
+    path_a = dir_a / rel_path
+    path_b = dir_b / rel_path
+    rows_html.append(f"""
+  <section>
+    <h2>{title}</h2>
+    <p class="instructions">{instructions}</p>
+    <div class="pair">
+      <figure>
+        <figcaption>{label_a}</figcaption>
+        {_img_tag(path_a)}
+      </figure>
+      <figure>
+        <figcaption>{label_b}</figcaption>
+        {_img_tag(path_b)}
+      </figure>
+    </div>
+  </section>""")
+
+html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Pipeline comparison: {label_a} vs {label_b}</title>
+<style>
+  body {{ font-family: sans-serif; max-width: 1600px; margin: 0 auto; padding: 1rem 2rem; background: #111; color: #ddd; }}
+  h1 {{ font-size: 1.3rem; color: #fff; border-bottom: 1px solid #444; padding-bottom: .4rem; }}
+  h2 {{ font-size: 1rem; color: #adf; margin: 2rem 0 .2rem; }}
+  p.instructions {{ font-size: .85rem; color: #aaa; margin: 0 0 .6rem; max-width: 900px; line-height: 1.5; }}
+  .pair {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }}
+  figure {{ margin: 0; }}
+  figcaption {{ font-size: .8rem; font-weight: bold; color: #fa0; margin-bottom: .3rem; }}
+  img {{ width: 100%; border: 1px solid #333; }}
+  .missing {{ color: #f88; font-style: italic; padding: .5rem; border: 1px dashed #f88; }}
+</style>
+</head>
+<body>
+<h1>Pipeline comparison — {label_a} (left) vs {label_b} (right) &nbsp;·&nbsp; subject {subject}</h1>
+{"".join(rows_html)}
+</body>
+</html>"""
+
+html_path = out_dir / "visual_comparison.html"
+html_path.write_text(html)
+print(f"Saved {html_path}")
