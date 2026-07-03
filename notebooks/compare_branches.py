@@ -221,10 +221,15 @@ else:
 
     # -----------------------------------------------------------------------
     # Gaze scalar summary
+    # NOTE: pre-click accuracy is intentionally excluded from the cross-branch
+    # comparison. In the PR branch, big_star is a calibration anchor, and
+    # pre-click gaze is always near the big_star (the dot being clicked), so
+    # accuracy at that location is guaranteed by construction — not an honest
+    # held-out measurement. Use TR_x projection (above) and big_star_residual_px
+    # (4-anchor refit) as the primary quality signals instead.
     # -----------------------------------------------------------------------
 
     def gaze_summary(g, label):
-        valid = g[g.gaze_valid]
         return {
             "branch": label,
             "total_samples": len(g),
@@ -233,59 +238,11 @@ else:
             "on_screen_%": round(100 * g.on_screen.mean(), 1),
         }
 
-    def preclick_accuracy(g, trials, window_ms=PRECLICK_WINDOW_MS):
-        """Mean gaze-to-target distance (canvas px) in the pre-click window."""
-        clicks = trials[trials.response_time.notna()].copy()
-        valid_mask = g.gaze_valid & g.homography_valid
-        g_valid = g[valid_mask][["behavior_t_ms", "gx_canvas", "gy_canvas"]].values
-        distances = []
-        for _, click in clicks.iterrows():
-            rt = float(click.response_time)
-            window = g_valid[
-                (g_valid[:, 0] >= rt - window_ms) & (g_valid[:, 0] <= rt)
-            ]
-            if len(window) < 5:
-                continue
-            mean_gx = window[:, 1].mean()
-            mean_gy = window[:, 2].mean()
-            click_cx = float(click.response_x) * CANVAS_W_PX
-            click_cy = float(click.response_y) * (CANVAS_H_PX / MAX_Y_COORD)
-            distances.append(float(np.hypot(mean_gx - click_cx, mean_gy - click_cy)))
-        return pd.Series(distances)
-
-    acc_a = preclick_accuracy(g_a, trials)
-    acc_b = preclick_accuracy(g_b, trials)
-
-    g_rows = []
-    for g, label, acc in [(g_a, label_a, acc_a), (g_b, label_b, acc_b)]:
-        row = gaze_summary(g, label)
-        row["preclick_accuracy median (canvas px)"] = round(acc.median(), 1) if len(acc) else float("nan")
-        row["preclick_accuracy N clicks"] = len(acc)
-        row["preclick_accuracy <250px %"] = round(100 * (acc < 250).mean(), 1) if len(acc) else float("nan")
-        g_rows.append(row)
-
+    g_rows = [gaze_summary(g, label) for g, label in [(g_a, label_a), (g_b, label_b)]]
     g_table = pd.DataFrame(g_rows).set_index("branch").T
     print("\n=== Gaze quality ===")
     print(g_table.to_string())
     g_table.to_csv(out_dir / "gaze_summary.csv")
-
-    # -----------------------------------------------------------------------
-    # Plot: pre-click accuracy histograms
-    # -----------------------------------------------------------------------
-
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for acc, label, color in [(acc_a, label_a, "steelblue"), (acc_b, label_b, "darkorange")]:
-        if len(acc):
-            ax.hist(acc.clip(upper=1000), bins=60, alpha=0.5, label=f"{label} (n={len(acc)}, med={acc.median():.0f}px)", color=color, density=True)
-    ax.axvline(250, color="red", lw=1, ls="--", label="250 px threshold")
-    ax.set_xlabel("mean pre-click gaze distance to target (canvas px)")
-    ax.set_ylabel("density")
-    ax.set_title("Pre-click gaze accuracy")
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_dir / "preclick_accuracy.png", dpi=120)
-    plt.close(fig)
-    print("Saved preclick_accuracy.png")
 
     # -----------------------------------------------------------------------
     # Matched-sample canvas shift: where does the PR move gaze?
@@ -372,8 +329,12 @@ PIPELINE_IMAGES = [
         "Gaze coverage and pre-click accuracy",
         "Left panel: homography_valid and on_screen rates over time in 10 s bins — "
         "PR should be equal or higher throughout. "
-        "Right panel: pre-click gaze distance to target; PR acceptance gate is "
-        "median < 250 canvas px (red line). Compare medians and tail shape.",
+        "Right panel: pre-click gaze distance to target. "
+        "NOTE: this metric is circular for the PR branch — big_star is a calibration "
+        "anchor, and pre-click gaze is always near the big_star (the dot being clicked), "
+        "so accuracy there is guaranteed by construction. "
+        "Treat the right panel as informational only; rely on TR_x outliers for the "
+        "primary quality comparison.",
     ),
     (
         str(Path("eyetrack") / "pre_click_gaze_trajectories.png"),

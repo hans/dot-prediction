@@ -69,7 +69,7 @@ Two panels:
 - **Right:** Pre-click gaze distance to target (canvas px), with a 250 px
   threshold line. PR acceptance criterion: median < 250 px.
 
-### `results/EC347/eyetrack/pre_click_gaze_trajectories.png`
+### `results/EC347/eyetrack/q.png`
 
 20 sampled clicks with gaze trajectories overlaid on the canvas. Look for
 whether trajectories in the PR branch are better localized around the target
@@ -133,32 +133,31 @@ Distribution overlay. PR branch tail should be substantially shorter.
 |---|---|
 | `homography_valid_%` | Equal or higher in PR |
 | `on_screen_%` | Equal or higher in PR |
-| `preclick_accuracy median` | Target < 250 canvas px; should improve in PR |
 
-### `preclick_accuracy.png`
-
-Histogram overlay of pre-click gaze accuracy. PR histogram should shift left
-(better accuracy), particularly for clicks on dots in the upper portion of the
-canvas where TR/TL projection error matters.
+Pre-click accuracy is **not** included here. The PR uses big_star as a
+calibration anchor, and pre-click gaze is always near the big_star (the dot
+being clicked), so accuracy at that location is guaranteed by the fit rather
+than demonstrated on held-out data. The right panel of
+`gaze_coverage_and_accuracy.png` shows it but treat it as informational only.
 
 ### `canvas_shift.png` and `canvas_shift.parquet`
 
 Where and by how much the PR changes projected gaze positions. Key questions:
-- Is the shift concentrated in one region of the canvas? (Expected: most shift
-  at the top of the canvas, near TR/TL, where the 5th anchor has the most
-  effect.)
-- Is the median shift large relative to the pre-click accuracy improvement? If
-  the shift is large but pre-click accuracy doesn't improve, the PR may be
-  moving gaze in the wrong direction for some frames.
+- Is the shift concentrated near the top of the canvas? (Expected: the 5th
+  anchor improves TR/TL conditioning, so the largest shifts should be near the
+  top edge where extrapolation error was worst.)
+- Is the shift distribution narrow (most samples shift < ~10 px)? Large
+  widespread shifts would suggest the PR is moving gaze in ways not explained
+  by the TR/TL fix alone.
 
 ---
 
 ## 6. Pass / fail criteria (from issue #8)
 
-| Criterion | Source | Target |
+| Criterion | Source | Notes |
 |---|---|---|
-| TR_x catastrophic outliers reduced | `h_summary.csv` | `\|TR_x\|>100k` lower in PR |
-| Pre-click gaze accuracy | `gaze_summary.csv` | median < 250 canvas px |
+| TR_x catastrophic outliers reduced | `h_summary.csv` | Primary metric — `\|TR_x\|>100k` lower in PR |
 | `homography_valid` no regression | `gaze_summary.csv` | PR ≥ main |
 | `on_screen` no regression | `gaze_summary.csv` | PR ≥ main |
 | `big_star_residual` no regression | `h_summary.csv` | PR median within ~5 px of main |
+| Pre-click gaze accuracy | `gaze_coverage_and_accuracy.png` (right panel) | Informational only — circular for PR branch; big_star is both calibration anchor and click target |
