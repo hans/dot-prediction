@@ -1,6 +1,6 @@
 {
   "setup": [
-    "uv sync"
+    "ln -s ~/Projects/dot-prediction/{data,results,results_scratch} ."
   ],
   "teardown": [],
   "run": []
