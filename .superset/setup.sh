@@ -1,1 +1,0 @@
-/Users/jon/Projects/claude-container/.superset/setup.sh
