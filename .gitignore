@@ -8,6 +8,7 @@
 data/
 old/
 results/
+results_*/
 config.local.yaml
 config_eyetrack.local.yaml
 .snakemake
@@ -15,6 +16,7 @@ config_eyetrack.local.yaml
 # uv / python
 .venv/
 __pycache__/
+__marimo__
 *.egg-info/
 
 # notebooks
