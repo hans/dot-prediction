@@ -13,6 +13,8 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 
 Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
 
+> **Environment note:** in the sandboxed container the `gh` binary is **not installed**, but `GH_TOKEN` is present and GitHub is reachable. Fall back to the REST API with `curl`/Python: `Authorization: Bearer $GH_TOKEN`, `Accept: application/vnd.github+json`. Repo is `hans/dot-prediction`. Sub-issues (`/issues/{n}/sub_issues`, body `{"sub_issue_id": <db-id>}`) and native dependencies (`/issues/{n}/dependencies/blocked_by`, body `{"issue_id": <db-id>}`) are both enabled; the open-blocker gate is `issue_dependencies_summary.blocked_by`.
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
