@@ -99,3 +99,47 @@ def test_window_1_returns_interpolated_only():
     np.testing.assert_allclose(out[0], 500.0, atol=1e-3)
     np.testing.assert_allclose(out[1], 502.5, atol=1.0)
     np.testing.assert_allclose(out[2], 505.0, atol=1e-3)
+
+
+# --- velocity clamp ---
+
+FPS = 25.0
+
+
+def test_velocity_clamp_caps_fast_excursion():
+    """A fast jump within a valid run is capped to max_drift_px_per_s."""
+    # 50 frames at 500, then jump to 600 — 100 px in one frame is far too fast
+    raw = [_c(500.0)] * 50 + [_c(600.0)] * 50
+    out = smooth_corners(raw, window=3, max_drift_px_per_s=2.0, fps=FPS)
+    # After 50 clamped steps at max 2/25=0.08 px/frame, drift ≤ 50*0.08 = 4 px
+    assert out[-1, 0, 0] < 510.0, f"Post-jump value {out[-1,0,0]:.1f} not clamped"
+
+
+def test_velocity_clamp_allows_slow_drift():
+    """Gradual drift within the budget passes through unchanged."""
+    # Drift 1 px/frame = 25 px/s — well under a 50 px/s cap
+    drift_per_frame = 1.0
+    n = 50
+    raw = [_c(500.0 + i * drift_per_frame) for i in range(n)]
+    out = smooth_corners(raw, window=3, max_drift_px_per_s=50.0, fps=FPS)
+    # End should be near 500 + 49 = 549, not clamped
+    np.testing.assert_allclose(out[-1, 0, 0], 549.0, atol=2.0)
+
+
+def test_velocity_clamp_resets_after_gap():
+    """After a None-gap the anchor resets; post-gap frames land near new position."""
+    # 10 frames at 500, 20 None frames, 10 frames at 560
+    raw = [_c(500.0)] * 10 + [None] * 20 + [_c(560.0)] * 10
+    # With a tight drift cap the clamp would prevent reaching 560 without the reset
+    out = smooth_corners(raw, window=3, max_drift_px_per_s=2.0, fps=FPS)
+    # Post-gap frames should be near 560, not still crawling from 500
+    np.testing.assert_allclose(out[-1, 0, 0], 560.0, atol=5.0)
+
+
+def test_velocity_clamp_no_effect_without_fps():
+    """Passing max_drift_px_per_s without fps silently skips the clamp."""
+    raw = [_c(500.0)] * 10 + [_c(600.0)] * 10
+    out_clamped = smooth_corners(raw, window=3, max_drift_px_per_s=2.0, fps=FPS)
+    out_unclamped = smooth_corners(raw, window=3, max_drift_px_per_s=2.0, fps=None)
+    # Without fps the clamp is skipped; values should differ
+    assert not np.allclose(out_clamped, out_unclamped)
