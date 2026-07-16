@@ -1,13 +1,17 @@
+# -*- coding: utf-8 -*-
 # ---
 # jupyter:
 #   jupytext:
+#     cell_metadata_filter: tags
+#     custom_cell_magics: kql
 #     formats: ipynb,py:percent
 #     text_representation:
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
+#       jupytext_version: 1.11.2
 #   kernelspec:
-#     display_name: Python 3
+#     display_name: dot-prediction
 #     language: python
 #     name: python3
 # ---
