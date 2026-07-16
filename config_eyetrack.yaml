@@ -6,7 +6,8 @@ subjects:
 
 clip_start_s: 120.0
 clip_duration_s: 30.0
-smoothing_window: 10
+smoothing_window_s: 3.0
+max_corner_drift_px_per_s: 2.0
 
 # iPad Safari canvas geometry — matches config.yaml for cross-pipeline consistency.
 behavior_canvas:

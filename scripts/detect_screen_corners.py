@@ -15,6 +15,7 @@ video_path = snakemake.input.video
 out_path = snakemake.output.parquet
 
 cap = cv2.VideoCapture(video_path)
+fps = cap.get(cv2.CAP_PROP_FPS)
 n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
 raw = []
@@ -28,9 +29,16 @@ cap.release()
 n_frames = len(raw)
 no_screen_mask = np.array([r is None for r in raw], dtype=bool)
 
+window_s = snakemake.config.get("smoothing_window_s", 3.0)
+window = max(1, round(window_s * fps))
+max_drift = snakemake.config.get("max_corner_drift_px_per_s")
+
+print(f"  Smoothing: window={window} frames ({window_s}s at {fps:.2f}fps), "
+      f"max_drift={max_drift} px/s")
+
 # smooth_corners interpolates gaps from None frames; we re-apply NaN afterward.
 # [TL, TR, BR, BL] ordering → index 2=BR, 3=BL.
-smoothed = smooth_corners(raw)  # (n_frames, 4, 2), float32
+smoothed = smooth_corners(raw, window=window, max_drift_px_per_s=max_drift, fps=fps)
 
 screen_bl = smoothed[:, 3, :].copy()  # BL
 screen_br = smoothed[:, 2, :].copy()  # BR
