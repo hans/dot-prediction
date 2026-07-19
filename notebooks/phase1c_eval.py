@@ -1,12 +1,19 @@
 # %% [markdown]
-# # Phase 1c — box corner detector evaluation
+# # Phase 1c — full-video homography (5-anchor fit)
 #
 # Runs the full Phase-1c pipeline:
-#   1. Preflight: detector accuracy against 26 hand-labeled frames.
+#   1. Preflight: box-corner detector accuracy against 26 hand-labeled frames.
 #   2. Full-video detection (forward + backward passes from seed frame 664).
+#      Each frame attempts a 5-anchor fit (screen_bl/br + box_bl/br + big_star
+#      via local star detector at the active dot's projected position). Frames
+#      where big_star is not detected (pre-experiment, between trials,
+#      occlusion) fall back to the v1 4-anchor fit and are tagged in
+#      ``n_anchors_used``.
 #   3. Interpolation pass for gaps.
-#   4. big_star held-out residual validation.
-#   5. Spot-check overlays (frames 664, 1550, 2288, 30125).
+#   4. big_star residual diagnostic (4-anchor refit at the 19 hand-labeled
+#      big_star frames — legacy comparator) + per-anchor LOO summary across
+#      all 5-anchor frames.
+#   5. Spot-check overlays.
 
 # %% tags=["parameters"]
 import sys
@@ -16,26 +23,33 @@ from tqdm.auto import tqdm, trange
 _ROOT = (
     Path(__file__).resolve().parent.parent
     if "__file__" in globals()
-    else Path.cwd()
-    if Path("src").is_dir()
-    else Path.cwd().parent
+    else Path.cwd() if Path("src").is_dir() else Path.cwd().parent
 )
 sys.path.insert(0, str(_ROOT / "src"))
 
 subject = "EC347"
 video_path = _ROOT / f"data/{subject}/tobii/scenevideo.mp4"
 labels_path = str(_ROOT / f"results/{subject}/homography_labels.parquet")
-calibration_path = str(_ROOT / f"results/{subject}/homography_eval/homography_box_calibration.json")
+calibration_path = str(
+    _ROOT / f"results/{subject}/homography_eval/homography_box_calibration.json"
+)
 screen_corners_path = str(_ROOT / f"results/{subject}/screen_corners.parquet")
 trials_path = str(_ROOT / f"results/{subject}/trials_with_video.parquet")
 out_per_frame = str(_ROOT / f"results_scratch/{subject}/phase1c_per_frame.parquet")
-out_calibration = str(_ROOT / f"results_scratch/{subject}/phase1c_calibration_used.json")
+out_calibration = str(
+    _ROOT / f"results_scratch/{subject}/phase1c_calibration_used.json"
+)
 
 SCREEN_W_PX = 2388
 SCREEN_H_PX = 1668
 URL_BAR_H_PX = 272
 CANVAS_X_PAD_PX = 233
 MAX_Y_COORD = 0.75
+
+# Video frame rate. Overridden from cv2.CAP_PROP_FPS at runtime; used only to
+# compute big_star age (newer → larger expected blob radius) for the local
+# detector's size-rejection check, so a small mismatch is tolerated.
+FPS = 30.0
 
 SEED_FRAME = 664
 # Frames to render as spot-check overlays. Empty list → auto-select seed frame
@@ -44,14 +58,16 @@ SPOT_CHECK_FRAMES: list[int] = []
 
 out_trajectory = str(Path(out_per_frame).parent / "cascade_trajectory.png")
 out_residual_hist = str(Path(out_per_frame).parent / "big_star_residual_hist.png")
-out_residual_scatter = str(Path(out_per_frame).parent / "big_star_residual_vs_frame.png")
+out_residual_scatter = str(
+    Path(out_per_frame).parent / "big_star_residual_vs_frame.png"
+)
 
 LABEL_COLORS_HEX = {
     "screen_bl": "#ffcc00",
     "screen_br": "#4488ff",
-    "box_bl":    "#ff44ff",
-    "box_br":    "#44ffff",
-    "big_star":  "#ffffff",
+    "box_bl": "#ff44ff",
+    "box_br": "#44ffff",
+    "big_star": "#ffffff",
 }
 
 # %%
@@ -59,13 +75,15 @@ import json
 
 import cv2
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from box_corner_detector import detect_box_corner
-from homography_solver import behavior_to_screen
+from big_star_detector import active_dot_screen_xy, detect_big_star
+from homography_solver import behavior_to_screen, loo_residuals
 
 video_path = Path(video_path)
 labels_path = Path(labels_path)
@@ -84,11 +102,13 @@ def _pt(H: np.ndarray, xy: tuple[float, float]) -> tuple[float, float]:
 
 
 def _mat(row) -> np.ndarray:
-    return np.array([
-        [row["h00"], row["h01"], row["h02"]],
-        [row["h10"], row["h11"], row["h12"]],
-        [row["h20"], row["h21"], row["h22"]],
-    ])
+    return np.array(
+        [
+            [row["h00"], row["h01"], row["h02"]],
+            [row["h10"], row["h11"], row["h12"]],
+            [row["h20"], row["h21"], row["h22"]],
+        ]
+    )
 
 
 def _hex_to_bgr(hex_color: str) -> tuple[int, int, int]:
@@ -113,8 +133,10 @@ box_bl_screen = tuple(calib["box_bl_screen"])
 box_br_screen = tuple(calib["box_br_screen"])
 
 print(f"Labels: {len(labels_df)} rows across {labels_df.frame_idx.nunique()} frames")
-print(f"Screen corners: {len(screen_corners_df)} frames, "
-      f"{screen_corners_df.no_screen.sum()} no-screen")
+print(
+    f"Screen corners: {len(screen_corners_df)} frames, "
+    f"{screen_corners_df.no_screen.sum()} no-screen"
+)
 print(f"box_bl_screen = ({box_bl_screen[0]:.1f}, {box_bl_screen[1]:.1f})")
 print(f"box_br_screen = ({box_br_screen[0]:.1f}, {box_br_screen[1]:.1f})")
 
@@ -152,7 +174,10 @@ else:
         if not ok:
             continue
 
-        by_type = {r.label_type: r for _, r in labels_df[labels_df.frame_idx == fidx].iterrows()}
+        by_type = {
+            r.label_type: r
+            for _, r in labels_df[labels_df.frame_idx == fidx].iterrows()
+        }
         if "box_bl" not in by_type or "box_br" not in by_type:
             continue
 
@@ -162,18 +187,28 @@ else:
         bl_det = detect_box_corner(frame, bl_label, "bl")
         br_det = detect_box_corner(frame, br_label, "br")
 
-        bl_err = float(np.hypot(bl_det[0] - bl_label[0], bl_det[1] - bl_label[1])) if bl_det else None
-        br_err = float(np.hypot(br_det[0] - br_label[0], br_det[1] - br_label[1])) if br_det else None
+        bl_err = (
+            float(np.hypot(bl_det[0] - bl_label[0], bl_det[1] - bl_label[1]))
+            if bl_det
+            else None
+        )
+        br_err = (
+            float(np.hypot(br_det[0] - br_label[0], br_det[1] - br_label[1]))
+            if br_det
+            else None
+        )
 
         note = "seed frame" if fidx == SEED_FRAME else ""
         if (bl_err is not None and bl_err > 8) or (br_err is not None and br_err > 8):
             note += (" | " if note else "") + "FLAG >8px"
-        preflight_rows.append({
-            "frame_idx": fidx,
-            "box_bl_error_px": bl_err,
-            "box_br_error_px": br_err,
-            "note": note,
-        })
+        preflight_rows.append(
+            {
+                "frame_idx": fidx,
+                "box_bl_error_px": bl_err,
+                "box_br_error_px": br_err,
+                "note": note,
+            }
+        )
 
     cap_pf.release()
 
@@ -189,16 +224,24 @@ for _, row in preflight_df.iterrows():
 if len(preflight_df) > 0:
     valid_bl = preflight_df.box_bl_error_px.dropna()
     valid_br = preflight_df.box_br_error_px.dropna()
-    print(f"\nbox_bl: median={valid_bl.median():.1f} px  max={valid_bl.max():.1f} px  "
-          f">5px: {(valid_bl > 5).sum()}/{len(valid_bl)}")
-    print(f"box_br: median={valid_br.median():.1f} px  max={valid_br.max():.1f} px  "
-          f">5px: {(valid_br > 5).sum()}/{len(valid_br)}")
+    print(
+        f"\nbox_bl: median={valid_bl.median():.1f} px  max={valid_bl.max():.1f} px  "
+        f">5px: {(valid_bl > 5).sum()}/{len(valid_bl)}"
+    )
+    print(
+        f"box_br: median={valid_br.median():.1f} px  max={valid_br.max():.1f} px  "
+        f">5px: {(valid_br > 5).sum()}/{len(valid_br)}"
+    )
 
-flag_count = preflight_df["note"].str.contains("FLAG").sum() if len(preflight_df) > 0 else 0
+flag_count = (
+    preflight_df["note"].str.contains("FLAG").sum() if len(preflight_df) > 0 else 0
+)
 if flag_count > 0:
-    print(f"\n[FLAG] {flag_count} frames with error > 8 px. "
-          "Check against known outliers (f2288, f9124, f10562, f19671, f20192, "
-          "f30125, f30135, f30175, f30950) before proceeding.")
+    print(
+        f"\n[FLAG] {flag_count} frames with error > 8 px. "
+        "Check against known outliers (f2288, f9124, f10562, f19671, f20192, "
+        "f30125, f30135, f30175, f30950) before proceeding."
+    )
 
 # %% [markdown]
 # ## Full-video detection
@@ -209,12 +252,14 @@ if flag_count > 0:
 # %%
 _H_COLS = ["h00", "h01", "h02", "h10", "h11", "h12", "h20", "h21", "h22"]
 _NAN = float("nan")
-_SCREEN_PTS = np.array([
-    [0.0, float(SCREEN_H_PX)],           # screen_bl
-    [float(SCREEN_W_PX), float(SCREEN_H_PX)],  # screen_br
-    list(box_bl_screen),                  # box_bl calibrated
-    list(box_br_screen),                  # box_br calibrated
-], dtype=np.float64)
+_BASE_SCREEN_PTS = [
+    (0.0, float(SCREEN_H_PX)),  # screen_bl
+    (float(SCREEN_W_PX), float(SCREEN_H_PX)),  # screen_br
+    tuple(box_bl_screen),  # box_bl calibrated
+    tuple(box_br_screen),  # box_br calibrated
+]
+# Order: [screen_bl, screen_br, box_bl, box_br, big_star]
+_ANCHOR_NAMES = ["screen_bl", "screen_br", "box_bl", "box_br", "big_star"]
 
 
 def _empty_result(t: int) -> dict:
@@ -223,10 +268,22 @@ def _empty_result(t: int) -> dict:
         **{k: _NAN for k in _H_COLS},
         "detection_status": "",
         "detection_reason": "",
-        "screen_bl_x": _NAN, "screen_bl_y": _NAN,
-        "screen_br_x": _NAN, "screen_br_y": _NAN,
-        "box_bl_x": _NAN, "box_bl_y": _NAN,
-        "box_br_x": _NAN, "box_br_y": _NAN,
+        "screen_bl_x": _NAN,
+        "screen_bl_y": _NAN,
+        "screen_br_x": _NAN,
+        "screen_br_y": _NAN,
+        "box_bl_x": _NAN,
+        "box_bl_y": _NAN,
+        "box_br_x": _NAN,
+        "box_br_y": _NAN,
+        "big_star_x": _NAN,
+        "big_star_y": _NAN,
+        "n_anchors_used": 0,
+        "loo_screen_bl_px": _NAN,
+        "loo_screen_br_px": _NAN,
+        "loo_box_bl_px": _NAN,
+        "loo_box_br_px": _NAN,
+        "loo_big_star_px": _NAN,
     }
 
 
@@ -240,10 +297,16 @@ def _process_frame(
     """Run one detection step. Returns (result_dict, new_H or None).
 
     box_labels: override dict for non-validation frames — used directly instead
-        of running the detector (re-anchors the tracker).
+        of running the box-corner detector (re-anchors the tracker).
     box_labels_rescue: all labeled frames including validation frames — used as
-        a fallback only when the detector is rejected by the geometry check.
+        a fallback only when the box-corner detector is rejected by the
+        geometry check.
     Both dicts have format: {frame_idx: {'bl': (x, y), 'br': (x, y)}}
+
+    big_star detection (5th anchor): always attempted via the local star
+    detector against the active dot's projected screen-xy, using H_prev as
+    the prediction. On failure (no active dot yet, prediction off-frame, no
+    warm blob in window) the frame falls back to a 4-anchor fit.
     """
     r = _empty_result(t)
 
@@ -309,64 +372,140 @@ def _process_frame(
             box_br_det = lbl.get("br")
             r["box_bl_x"], r["box_bl_y"] = box_bl_det
             r["box_br_x"], r["box_br_y"] = box_br_det
-            r["detection_reason"] = f"rescued_by_label(horiz_sep={horiz_sep:.0f},vert_spread={vert_spread:.0f})"
+            r["detection_reason"] = (
+                f"rescued_by_label(horiz_sep={horiz_sep:.0f},vert_spread={vert_spread:.0f})"
+            )
         else:
             r["detection_status"] = "geometric_invalid"
-            r["detection_reason"] = f"horiz_sep={horiz_sep:.0f},vert_spread={vert_spread:.0f}"
+            r["detection_reason"] = (
+                f"horiz_sep={horiz_sep:.0f},vert_spread={vert_spread:.0f}"
+            )
             return r, None
 
-    frame_pts = np.array([
-        [sc.screen_bl_x, sc.screen_bl_y],
-        [sc.screen_br_x, sc.screen_br_y],
-        list(box_bl_det),
-        list(box_br_det),
-    ], dtype=np.float64)
+    # Step E: big_star detection (5th anchor). Predict via H_prev — using the
+    # just-fit 4-anchor H_new would re-introduce its own TR/TL extrapolation
+    # bias into the prediction. H_prev's screen-interior projection is much
+    # less sensitive to box-corner jitter, so it's a robust window centre.
+    screen_pts_list = list(_BASE_SCREEN_PTS)
+    frame_pts_list = [
+        (float(sc.screen_bl_x), float(sc.screen_bl_y)),
+        (float(sc.screen_br_x), float(sc.screen_br_y)),
+        (float(box_bl_det[0]), float(box_bl_det[1])),
+        (float(box_br_det[0]), float(box_br_det[1])),
+    ]
+    big_star_used = False
+    big_star_reason = ""
+    active = active_dot_screen_xy(
+        trials_df,
+        t,
+        behavior_to_screen,
+        screen_w_px=SCREEN_W_PX,
+        screen_h_px=SCREEN_H_PX,
+        url_bar_h_px=URL_BAR_H_PX,
+        canvas_x_pad_px=CANVAS_X_PAD_PX,
+        max_y_coord=MAX_Y_COORD,
+    )
+    if active is None:
+        big_star_reason = "no_active_dot"
+    else:
+        bs_screen, reveal_frame, _trial_idx, _tpt = active
+        bs_xy = detect_big_star(
+            frame_bgr,
+            H_prev,
+            bs_screen,
+            reveal_frame=reveal_frame,
+            current_frame=t,
+            fps=FPS,
+        )
+        if bs_xy is None:
+            big_star_reason = "big_star_not_detected"
+        else:
+            screen_pts_list.append(bs_screen)
+            frame_pts_list.append(bs_xy)
+            r["big_star_x"], r["big_star_y"] = bs_xy
+            big_star_used = True
 
-    H_new, _ = cv2.findHomography(_SCREEN_PTS, frame_pts)
+    frame_pts = np.array(frame_pts_list, dtype=np.float64)
+    screen_pts = np.array(screen_pts_list, dtype=np.float64)
+
+    H_new, _ = cv2.findHomography(screen_pts, frame_pts)
     if H_new is None:
         r["detection_status"] = "missing_homography_failed"
         r["detection_reason"] = "missing_homography_failed"
         return r, None
     H_new = H_new / H_new[2, 2]
 
-    r.update({
-        "h00": H_new[0, 0], "h01": H_new[0, 1], "h02": H_new[0, 2],
-        "h10": H_new[1, 0], "h11": H_new[1, 1], "h12": H_new[1, 2],
-        "h20": H_new[2, 0], "h21": H_new[2, 1], "h22": H_new[2, 2],
-    })
+    r.update(
+        {
+            "h00": H_new[0, 0],
+            "h01": H_new[0, 1],
+            "h02": H_new[0, 2],
+            "h10": H_new[1, 0],
+            "h11": H_new[1, 1],
+            "h12": H_new[1, 2],
+            "h20": H_new[2, 0],
+            "h21": H_new[2, 1],
+            "h22": H_new[2, 2],
+        }
+    )
+    r["n_anchors_used"] = len(screen_pts_list)
     r["detection_status"] = "detected"
-    r["detection_reason"] = ""
+    if r.get("detection_reason", "") == "":
+        # Preserve "rescued_by_label" if it was set above; otherwise tag with
+        # the 5-anchor outcome for diagnostics.
+        r["detection_reason"] = "" if big_star_used else big_star_reason
+
+    if big_star_used:
+        loo = loo_residuals(screen_pts, frame_pts)
+        for i, name in enumerate(_ANCHOR_NAMES[: len(loo)]):
+            r[f"loo_{name}_px"] = loo[i]
+
     return r, H_new
 
 
 # %%
 # Build seed H from frame 664 hand labels.
-seed_labels = {r.label_type: r for _, r in labels_df[labels_df.frame_idx == SEED_FRAME].iterrows()}
-seed_frame_pts = np.array([
-    [seed_labels["screen_bl"].x_frame, seed_labels["screen_bl"].y_frame],
-    [seed_labels["screen_br"].x_frame, seed_labels["screen_br"].y_frame],
-    [seed_labels["box_bl"].x_frame,    seed_labels["box_bl"].y_frame],
-    [seed_labels["box_br"].x_frame,    seed_labels["box_br"].y_frame],
-], dtype=np.float64)
-H_seed, _ = cv2.findHomography(_SCREEN_PTS, seed_frame_pts)
+seed_labels = {
+    r.label_type: r for _, r in labels_df[labels_df.frame_idx == SEED_FRAME].iterrows()
+}
+seed_frame_pts = np.array(
+    [
+        [seed_labels["screen_bl"].x_frame, seed_labels["screen_bl"].y_frame],
+        [seed_labels["screen_br"].x_frame, seed_labels["screen_br"].y_frame],
+        [seed_labels["box_bl"].x_frame, seed_labels["box_bl"].y_frame],
+        [seed_labels["box_br"].x_frame, seed_labels["box_br"].y_frame],
+    ],
+    dtype=np.float64,
+)
+_SEED_SCREEN_PTS = np.array(_BASE_SCREEN_PTS, dtype=np.float64)
+H_seed, _ = cv2.findHomography(_SEED_SCREEN_PTS, seed_frame_pts)
 H_seed = H_seed / H_seed[2, 2]
 
 seed_result = _empty_result(SEED_FRAME)
-seed_result.update({
-    "h00": H_seed[0, 0], "h01": H_seed[0, 1], "h02": H_seed[0, 2],
-    "h10": H_seed[1, 0], "h11": H_seed[1, 1], "h12": H_seed[1, 2],
-    "h20": H_seed[2, 0], "h21": H_seed[2, 1], "h22": H_seed[2, 2],
-    "detection_status": "detected",
-    "detection_reason": "",
-    "screen_bl_x": seed_labels["screen_bl"].x_frame,
-    "screen_bl_y": seed_labels["screen_bl"].y_frame,
-    "screen_br_x": seed_labels["screen_br"].x_frame,
-    "screen_br_y": seed_labels["screen_br"].y_frame,
-    "box_bl_x": seed_labels["box_bl"].x_frame,
-    "box_bl_y": seed_labels["box_bl"].y_frame,
-    "box_br_x": seed_labels["box_br"].x_frame,
-    "box_br_y": seed_labels["box_br"].y_frame,
-})
+seed_result.update(
+    {
+        "h00": H_seed[0, 0],
+        "h01": H_seed[0, 1],
+        "h02": H_seed[0, 2],
+        "h10": H_seed[1, 0],
+        "h11": H_seed[1, 1],
+        "h12": H_seed[1, 2],
+        "h20": H_seed[2, 0],
+        "h21": H_seed[2, 1],
+        "h22": H_seed[2, 2],
+        "detection_status": "detected",
+        "detection_reason": "",
+        "screen_bl_x": seed_labels["screen_bl"].x_frame,
+        "screen_bl_y": seed_labels["screen_bl"].y_frame,
+        "screen_br_x": seed_labels["screen_br"].x_frame,
+        "screen_br_y": seed_labels["screen_br"].y_frame,
+        "box_bl_x": seed_labels["box_bl"].x_frame,
+        "box_bl_y": seed_labels["box_bl"].y_frame,
+        "box_br_x": seed_labels["box_br"].x_frame,
+        "box_br_y": seed_labels["box_br"].y_frame,
+        "n_anchors_used": 4,  # seed is always 4-anchor (hand labels, no big_star)
+    }
+)
 print(f"Seed H built from frame {SEED_FRAME} hand labels.")
 
 # %%
@@ -375,7 +514,8 @@ print(f"Seed H built from frame {SEED_FRAME} hand labels.")
 # big_star validation frames are EXCLUDED from the override so that the held-out
 # residual measures real tracker quality rather than label-override quality.
 _big_star_val_frames = set(
-    int(f) for f in labels_df[
+    int(f)
+    for f in labels_df[
         (labels_df.label_type == "big_star")
         & (labels_df.visible == True)
         & (labels_df.quality == "confident")
@@ -397,7 +537,9 @@ for fidx, grp in _box_labels_df.groupby("frame_idx"):
         _box_labels[int(fidx)] = entry
 n_heldout = len(_big_star_val_frames)
 print(f"Label-override dict built: {len(_box_labels)} frames with both bl+br labels.")
-print(f"  ({n_heldout} big_star validation frames held out — tracker must predict at those frames)")
+print(
+    f"  ({n_heldout} big_star validation frames held out — tracker must predict at those frames)"
+)
 
 # Rescue dict: all box-labeled frames (including validation) — only used as
 # fallback when the geometry check fires and would otherwise discard the frame.
@@ -409,7 +551,9 @@ for fidx, grp in _box_labels_df.groupby("frame_idx"):
         entry[key] = (float(row.x_frame), float(row.y_frame))
     if "bl" in entry and "br" in entry:
         _box_labels_rescue[int(fidx)] = entry
-print(f"Rescue dict built: {len(_box_labels_rescue)} frames (includes validation frames).")
+print(
+    f"Rescue dict built: {len(_box_labels_rescue)} frames (includes validation frames)."
+)
 
 # %%
 if not video_path.exists():
@@ -417,7 +561,10 @@ if not video_path.exists():
 
 cap = cv2.VideoCapture(str(video_path))
 n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-print(f"Video: {n_frames} frames")
+_fps_actual = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+if _fps_actual > 0:
+    FPS = _fps_actual
+print(f"Video: {n_frames} frames at {FPS:.2f} fps")
 
 results: dict[int, dict] = {SEED_FRAME: seed_result}
 
@@ -478,27 +625,33 @@ per_frame_df = (
 # and fills them from neighboring good detections.
 
 # %%
-_JUMP_THRESHOLD_PX = 25   # flag single-frame delta > this (unused below but documents intent)
-_DRIFT_PERSIST_PX  = 60   # flag frames deviating > this from pre-jump level
-_DRIFT_REF_SPAN    = 2000  # only include preceding detections within this many frame indices
+_JUMP_THRESHOLD_PX = (
+    25  # flag single-frame delta > this (unused below but documents intent)
+)
+_DRIFT_PERSIST_PX = 60  # flag frames deviating > this from pre-jump level
+_DRIFT_REF_SPAN = (
+    2000  # only include preceding detections within this many frame indices
+)
 
 _b3_det_mask = per_frame_df["detection_status"] == "detected"
-_b3_det_df   = per_frame_df.loc[_b3_det_mask, ["box_bl_x", "box_bl_y"]].copy()
+_b3_det_df = per_frame_df.loc[_b3_det_mask, ["box_bl_x", "box_bl_y"]].copy()
 
 # Frames with box labels are ground truth — never flag them regardless of position
 _b3_box_labeled = set(int(f) for f in _box_labels_df.frame_idx.unique())
 
 flagged: set[int] = set()
 bl_y_vals = _b3_det_df["box_bl_y"].values
-bl_y_idx  = _b3_det_df.index.values
+bl_y_idx = _b3_det_df.index.values
 
 for _i in range(50, len(bl_y_vals)):
     cur_fidx = bl_y_idx[_i]
     if cur_fidx in _b3_box_labeled:
         continue  # ground-truth label — never flag
-    pre = [bl_y_vals[_j] for _j in range(max(0, _i - 100), _i)
-           if bl_y_idx[_j] not in flagged
-           and cur_fidx - bl_y_idx[_j] <= _DRIFT_REF_SPAN]
+    pre = [
+        bl_y_vals[_j]
+        for _j in range(max(0, _i - 100), _i)
+        if bl_y_idx[_j] not in flagged and cur_fidx - bl_y_idx[_j] <= _DRIFT_REF_SPAN
+    ]
     if len(pre) < 10:
         continue
     ref = np.median(pre)
@@ -529,7 +682,9 @@ for i in per_frame_df.index[need_fill]:
         t_r = int(per_frame_df.loc[rp, "frame_idx"])
         alpha = (t - t_l) / (t_r - t_l)
         for col in _H_COLS:
-            per_frame_df.loc[i, col] = (1 - alpha) * per_frame_df.loc[lp, col] + alpha * per_frame_df.loc[rp, col]
+            per_frame_df.loc[i, col] = (1 - alpha) * per_frame_df.loc[
+                lp, col
+            ] + alpha * per_frame_df.loc[rp, col]
         per_frame_df.loc[i, "detection_status"] = "interpolated"
     elif left_m.any():
         lp = det_positions[left_m][-1]
@@ -545,7 +700,24 @@ for i in per_frame_df.index[need_fill]:
 print("Interpolation pass complete.")
 
 # %% [markdown]
-# ## big_star held-out residual
+# ## big_star residual against hand labels
+#
+# big_star is now in the per-frame fit (5-anchor) when detection succeeds, so
+# the saved H trivially projects the *detected* big_star onto itself — the old
+# "H × true_xy vs labeled_xy" metric is no longer meaningful as an independent
+# check. Two replacement diagnostics:
+#
+#   1. ``loo_big_star_px`` (computed per-frame above): drop the detected
+#      big_star, refit 4-anchor, measure residual at the detected big_star
+#      frame-xy. Indicates whether the 4-anchor fit alone would have predicted
+#      the in-fit big_star well — i.e. how much the 5th anchor moved the H.
+#
+#   2. ``big_star_residual_px`` (computed below for the 19 hand-labeled
+#      big_star frames): re-fit each frame from screen_bl/br + box_bl/br ONLY
+#      (drop big_star entirely), project the labeled true_xy through that
+#      4-anchor H, measure distance to the labeled big_star frame-xy. This
+#      preserves the legacy column's semantics — it's the 4-anchor fallback
+#      regime's residual at the hand-labeled big_star locations.
 
 # %%
 star_labels = labels_df[
@@ -554,41 +726,76 @@ star_labels = labels_df[
     & (labels_df.quality == "confident")
 ]
 
-h_lookup = per_frame_df[
-    per_frame_df.detection_status.isin(["detected", "interpolated", "extrapolated"])
-].set_index("frame_idx")
-
 residual_rows = []
 for _, label_row in star_labels.iterrows():
     fidx = int(label_row.frame_idx)
-    if fidx not in h_lookup.index:
+    pf_row = per_frame_df[per_frame_df.frame_idx == fidx]
+    if pf_row.empty:
         continue
-    h_row = h_lookup.loc[fidx]
-    H_mat = _mat(h_row)
+    pf_row = pf_row.iloc[0]
+    status = pf_row.detection_status
+    if status not in ("detected", "interpolated", "extrapolated"):
+        continue
+    # Re-fit 4-anchor (drop big_star) from the saved per-frame anchor positions.
+    if any(
+        pd.isna(
+            [pf_row.screen_bl_x, pf_row.screen_br_x, pf_row.box_bl_x, pf_row.box_br_x]
+        )
+    ):
+        continue
+    screen_pts_4 = np.array(
+        [
+            (0.0, float(SCREEN_H_PX)),
+            (float(SCREEN_W_PX), float(SCREEN_H_PX)),
+            tuple(box_bl_screen),
+            tuple(box_br_screen),
+        ],
+        dtype=np.float64,
+    )
+    frame_pts_4 = np.array(
+        [
+            (float(pf_row.screen_bl_x), float(pf_row.screen_bl_y)),
+            (float(pf_row.screen_br_x), float(pf_row.screen_br_y)),
+            (float(pf_row.box_bl_x), float(pf_row.box_bl_y)),
+            (float(pf_row.box_br_x), float(pf_row.box_br_y)),
+        ],
+        dtype=np.float64,
+    )
+    H_4pt, _ = cv2.findHomography(screen_pts_4, frame_pts_4)
+    if H_4pt is None:
+        continue
+    H_4pt = H_4pt / H_4pt[2, 2]
 
     prior = trials_df[
-        trials_df.video_frame_reveal.notna()
-        & (trials_df.video_frame_reveal <= fidx)
+        trials_df.video_frame_reveal.notna() & (trials_df.video_frame_reveal <= fidx)
     ]
     if prior.empty:
         continue
     active = prior.loc[prior.video_frame_reveal.idxmax()]
     true_sx, true_sy = behavior_to_screen(
-        float(active.true_x), float(active.true_y),
-        screen_w_px=SCREEN_W_PX, screen_h_px=SCREEN_H_PX,
-        url_bar_h_px=URL_BAR_H_PX, canvas_x_pad_px=CANVAS_X_PAD_PX,
+        float(active.true_x),
+        float(active.true_y),
+        screen_w_px=SCREEN_W_PX,
+        screen_h_px=SCREEN_H_PX,
+        url_bar_h_px=URL_BAR_H_PX,
+        canvas_x_pad_px=CANVAS_X_PAD_PX,
         max_y_coord=MAX_Y_COORD,
     )
-    pred_fx, pred_fy = _pt(H_mat, (true_sx, true_sy))
+    pred_fx, pred_fy = _pt(H_4pt, (true_sx, true_sy))
     labeled_fx = float(label_row.x_frame)
     labeled_fy = float(label_row.y_frame)
-    residual_rows.append({
-        "frame_idx": fidx,
-        "residual_px": float(np.hypot(pred_fx - labeled_fx, pred_fy - labeled_fy)),
-        "true_screen_x": true_sx, "true_screen_y": true_sy,
-        "predicted_frame_x": pred_fx, "predicted_frame_y": pred_fy,
-        "labeled_frame_x": labeled_fx, "labeled_frame_y": labeled_fy,
-    })
+    residual_rows.append(
+        {
+            "frame_idx": fidx,
+            "residual_px": float(np.hypot(pred_fx - labeled_fx, pred_fy - labeled_fy)),
+            "true_screen_x": true_sx,
+            "true_screen_y": true_sy,
+            "predicted_frame_x": pred_fx,
+            "predicted_frame_y": pred_fy,
+            "labeled_frame_x": labeled_fx,
+            "labeled_frame_y": labeled_fy,
+        }
+    )
 
 residuals_df = pd.DataFrame(residual_rows)
 
@@ -599,7 +806,7 @@ if len(residuals_df) > 0:
         lambda f: (int(f) in _box_labels) or (int(f) == SEED_FRAME)
     )
 
-# Attach big_star_residual_px to per_frame_df.
+# Attach big_star_residual_px (4-anchor refit at hand-labeled frames) to per_frame_df.
 per_frame_df["big_star_residual_px"] = _NAN
 if len(residuals_df) > 0:
     res_lookup = residuals_df.set_index("frame_idx")["residual_px"]
@@ -628,12 +835,20 @@ print("-" * 52)
 for status in ["detected", "interpolated", "extrapolated", "no_screen"]:
     n = int(status_counts.get(status, 0))
     pct_tot = 100 * n / n_total if n_total > 0 else 0
-    pct_elig = 100 * n / n_eligible if n_eligible > 0 and status != "no_screen" else float("nan")
+    pct_elig = (
+        100 * n / n_eligible
+        if n_eligible > 0 and status != "no_screen"
+        else float("nan")
+    )
     pct_elig_s = f"{pct_elig:.1f}%" if not np.isnan(pct_elig) else "—"
     print(f"{status:<18}  {n:>8}  {pct_tot:>7.1f}%  {pct_elig_s:>10}")
 
 # Other missing statuses
-other = [s for s in status_counts.index if s not in ["detected","interpolated","extrapolated","no_screen"]]
+other = [
+    s
+    for s in status_counts.index
+    if s not in ["detected", "interpolated", "extrapolated", "no_screen"]
+]
 for s in other:
     n = int(status_counts[s])
     pct = 100 * n / n_total
@@ -642,7 +857,9 @@ for s in other:
 n_detected = int(status_counts.get("detected", 0))
 det_rate = n_detected / n_eligible if n_eligible > 0 else 0
 if det_rate < 0.85:
-    print(f"\n[FLAG] detected rate among eligible frames = {det_rate:.1%} < 85% threshold.")
+    print(
+        f"\n[FLAG] detected rate among eligible frames = {det_rate:.1%} < 85% threshold."
+    )
 
 # %% [markdown]
 # ## big_star residual histogram
@@ -651,9 +868,11 @@ if det_rate < 0.85:
 if len(residuals_df) > 0:
     med = residuals_df.residual_px.median()
     q1, q3 = residuals_df.residual_px.quantile([0.25, 0.75])
-    print(f"\nbig_star validation: N={len(residuals_df)}  "
-          f"median={med:.2f} px  IQR=[{q1:.2f}, {q3:.2f}]  "
-          f"max={residuals_df.residual_px.max():.2f}")
+    print(
+        f"\nbig_star validation: N={len(residuals_df)}  "
+        f"median={med:.2f} px  IQR=[{q1:.2f}, {q3:.2f}]  "
+        f"max={residuals_df.residual_px.max():.2f}"
+    )
 
     # Report tracker-only frames (the real metric) vs. override/seed frames.
     if "box_override" in residuals_df.columns:
@@ -661,15 +880,21 @@ if len(residuals_df) > 0:
         override_res = residuals_df[residuals_df.box_override]
         if len(tracker_res) > 0:
             tm = tracker_res.residual_px.median()
-            print(f"  tracker-only (N={len(tracker_res)}): median={tm:.2f} px  "
-                  f"max={tracker_res.residual_px.max():.2f}  "
-                  f">20px: {(tracker_res.residual_px > 20).sum()}/{len(tracker_res)}")
+            print(
+                f"  tracker-only (N={len(tracker_res)}): median={tm:.2f} px  "
+                f"max={tracker_res.residual_px.max():.2f}  "
+                f">20px: {(tracker_res.residual_px > 20).sum()}/{len(tracker_res)}"
+            )
         else:
-            print("  [WARN] No tracker-only big_star frames — all validation frames are overridden.")
+            print(
+                "  [WARN] No tracker-only big_star frames — all validation frames are overridden."
+            )
         if len(override_res) > 0:
-            print(f"  label-override/seed (N={len(override_res)}): "
-                  f"median={override_res.residual_px.median():.2f} px  "
-                  f"(measures screen-corner quality, not tracker)")
+            print(
+                f"  label-override/seed (N={len(override_res)}): "
+                f"median={override_res.residual_px.median():.2f} px  "
+                f"(measures screen-corner quality, not tracker)"
+            )
 
     # Per-frame table for tracker-only frames.
     if "box_override" in residuals_df.columns and len(tracker_res) > 0:
@@ -679,9 +904,15 @@ if len(residuals_df) > 0:
             flag = "  [FLAG]" if rr.residual_px > 20 else ""
             print(f"  {int(rr.frame_idx):>7}  {rr.residual_px:>12.2f}{flag}")
 
-    tm_val = tracker_res.residual_px.median() if "box_override" in residuals_df.columns and len(tracker_res) > 0 else med
+    tm_val = (
+        tracker_res.residual_px.median()
+        if "box_override" in residuals_df.columns and len(tracker_res) > 0
+        else med
+    )
     if tm_val > 20:
-        print("  [FLAG] Tracker-only median > 20 px — Phase-1c box corner detector has systematic bias.")
+        print(
+            "  [FLAG] Tracker-only median > 20 px — Phase-1c box corner detector has systematic bias."
+        )
 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.hist(residuals_df.residual_px, bins=10, edgecolor="white", color="#4488ff")
@@ -691,7 +922,8 @@ if len(residuals_df) > 0:
     ax.set_title("Phase-1c big_star reprojection residuals")
     fig.suptitle(
         f"N={len(residuals_df)}  median={med:.1f} px  IQR=[{q1:.1f}, {q3:.1f}]",
-        fontsize=10, y=0.97,
+        fontsize=10,
+        y=0.97,
     )
     ax.legend()
     hist_path = Path(out_residual_hist)
@@ -704,7 +936,7 @@ if len(residuals_df) > 0:
     ax2.axhline(20, color="red", linestyle="--", linewidth=1, label="20 px threshold")
     ax2.set_xlabel("frame_idx")
     ax2.set_ylabel("Residual (px)")
-    ax2.set_title("Phase-1c big_star residual vs frame index")
+    ax2.set_title("Phase-1c big_star residual vs frame index (4-anchor refit)")
     ax2.legend()
     drift_path = Path(out_residual_scatter)
     fig2.savefig(drift_path, dpi=120, bbox_inches="tight")
@@ -712,6 +944,54 @@ if len(residuals_df) > 0:
     print(f"Drift plot saved → {drift_path}")
 else:
     print("(no big_star residuals — skipping histogram)")
+
+# %% [markdown]
+# ## 5-anchor adoption & LOO residual summary
+#
+# Reports the fraction of `detected` frames that use 5 anchors (big_star found
+# by local search) and the distribution of leave-one-out residuals per anchor.
+# A small LOO residual for big_star (median < 5 px) confirms the in-fit anchor
+# is consistent with the 4 others; a large median (> 20 px) means big_star is
+# being detected on the wrong blob or the box-corner anchors have drifted.
+
+# %%
+det_only = per_frame_df[per_frame_df.detection_status == "detected"]
+n_det = len(det_only)
+n_5 = int((det_only.n_anchors_used == 5).sum())
+n_4 = int((det_only.n_anchors_used == 4).sum())
+print(f"\nDetected frames: {n_det:>7}")
+print(
+    f"  5-anchor (big_star in fit): {n_5:>7}  ({100*n_5/n_det:>5.1f}%)"
+    if n_det > 0
+    else ""
+)
+print(
+    f"  4-anchor fallback:          {n_4:>7}  ({100*n_4/n_det:>5.1f}%)"
+    if n_det > 0
+    else ""
+)
+
+_loo_cols = [
+    "loo_screen_bl_px",
+    "loo_screen_br_px",
+    "loo_box_bl_px",
+    "loo_box_br_px",
+    "loo_big_star_px",
+]
+loo_5 = det_only[det_only.n_anchors_used == 5]
+if len(loo_5) > 0:
+    print(f"\nLOO residuals on 5-anchor frames (N={len(loo_5)}):")
+    print(f"  {'anchor':<22}  {'median':>8}  {'p90':>8}  {'max':>10}")
+    print("  " + "-" * 56)
+    for col in _loo_cols:
+        vals = loo_5[col].dropna()
+        if len(vals) == 0:
+            continue
+        med_v = float(vals.median())
+        p90_v = float(vals.quantile(0.9))
+        max_v = float(vals.max())
+        flag = "  [FLAG]" if med_v > 20 else ""
+        print(f"  {col:<22}  {med_v:>8.2f}  {p90_v:>8.2f}  {max_v:>10.2f}{flag}")
 
 # %% [markdown]
 # ## Trajectory plot
@@ -723,23 +1003,80 @@ _traj_labels_br = labels_df[labels_df.label_type == "box_br"][["frame_idx", "y_f
 _snap_lo, _snap_hi = 750, 1200
 fig_t, (ax_full_t, ax_zoom_t) = plt.subplots(2, 1, figsize=(14, 8))
 for ax_t, xlim_t, title_t in [
-    (ax_full_t, None, "Box corner y-positions vs screen corner y-positions (full video)"),
+    (
+        ax_full_t,
+        None,
+        "Box corner y-positions vs screen corner y-positions (full video)",
+    ),
     (ax_zoom_t, (_snap_lo, _snap_hi), f"Zoomed: frames {_snap_lo}–{_snap_hi}"),
 ]:
     _sub = per_frame_df.copy()
     if xlim_t:
         _sub = _sub[(_sub.frame_idx >= xlim_t[0]) & (_sub.frame_idx <= xlim_t[1])]
-    _det = _sub[_sub.detection_status.isin(["detected", "interpolated", "extrapolated"])]
-    ax_t.plot(_det.frame_idx, _det.box_br_y, color="cyan", lw=0.8, alpha=0.8, label="box_br_y")
-    ax_t.plot(_det.frame_idx, _det.box_bl_y, color="magenta", lw=0.8, alpha=0.8, label="box_bl_y")
-    ax_t.plot(_sub.frame_idx, _sub.screen_bl_y, color="gold", lw=0.7, alpha=0.6, label="screen_bl_y")
-    ax_t.plot(_sub.frame_idx, _sub.screen_br_y, color="dodgerblue", lw=0.7, alpha=0.6, label="screen_br_y")
-    _lbl_sub = _traj_labels_bl if xlim_t is None else _traj_labels_bl[
-        (_traj_labels_bl.frame_idx >= xlim_t[0]) & (_traj_labels_bl.frame_idx <= xlim_t[1])]
-    _lbr_sub = _traj_labels_br if xlim_t is None else _traj_labels_br[
-        (_traj_labels_br.frame_idx >= xlim_t[0]) & (_traj_labels_br.frame_idx <= xlim_t[1])]
-    ax_t.scatter(_lbr_sub.frame_idx, _lbr_sub.y_frame, color="dodgerblue", marker="s", s=40, zorder=5, label="box_br label")
-    ax_t.scatter(_lbl_sub.frame_idx, _lbl_sub.y_frame, color="magenta", marker="s", s=40, zorder=5, label="box_bl label")
+    _det = _sub[
+        _sub.detection_status.isin(["detected", "interpolated", "extrapolated"])
+    ]
+    ax_t.plot(
+        _det.frame_idx, _det.box_br_y, color="cyan", lw=0.8, alpha=0.8, label="box_br_y"
+    )
+    ax_t.plot(
+        _det.frame_idx,
+        _det.box_bl_y,
+        color="magenta",
+        lw=0.8,
+        alpha=0.8,
+        label="box_bl_y",
+    )
+    ax_t.plot(
+        _sub.frame_idx,
+        _sub.screen_bl_y,
+        color="gold",
+        lw=0.7,
+        alpha=0.6,
+        label="screen_bl_y",
+    )
+    ax_t.plot(
+        _sub.frame_idx,
+        _sub.screen_br_y,
+        color="dodgerblue",
+        lw=0.7,
+        alpha=0.6,
+        label="screen_br_y",
+    )
+    _lbl_sub = (
+        _traj_labels_bl
+        if xlim_t is None
+        else _traj_labels_bl[
+            (_traj_labels_bl.frame_idx >= xlim_t[0])
+            & (_traj_labels_bl.frame_idx <= xlim_t[1])
+        ]
+    )
+    _lbr_sub = (
+        _traj_labels_br
+        if xlim_t is None
+        else _traj_labels_br[
+            (_traj_labels_br.frame_idx >= xlim_t[0])
+            & (_traj_labels_br.frame_idx <= xlim_t[1])
+        ]
+    )
+    ax_t.scatter(
+        _lbr_sub.frame_idx,
+        _lbr_sub.y_frame,
+        color="dodgerblue",
+        marker="s",
+        s=40,
+        zorder=5,
+        label="box_br label",
+    )
+    ax_t.scatter(
+        _lbl_sub.frame_idx,
+        _lbl_sub.y_frame,
+        color="magenta",
+        marker="s",
+        s=40,
+        zorder=5,
+        label="box_bl label",
+    )
     if xlim_t is None:
         ax_t.axvspan(_snap_lo, _snap_hi, alpha=0.08, color="red")
     ax_t.set_xlabel("frame_idx")
@@ -761,26 +1098,33 @@ if SPOT_CHECK_FRAMES:
     _spot_frames = list(SPOT_CHECK_FRAMES)
 else:
     _top_res = (
-        residuals_df.sort_values("residual_px", ascending=False).head(8).frame_idx.tolist()
-        if len(residuals_df) > 0 else []
+        residuals_df.sort_values("residual_px", ascending=False)
+        .head(8)
+        .frame_idx.tolist()
+        if len(residuals_df) > 0
+        else []
     )
     _spot_frames = sorted(set([SEED_FRAME] + [int(f) for f in _top_res]))
 print(f"Spot-check frames: {_spot_frames}")
 
 
 def _draw_filled(img, xy, color, radius=7):
-    cv2.circle(img, (int(round(xy[0])), int(round(xy[1]))), radius, color, -1, cv2.LINE_AA)
+    cv2.circle(
+        img, (int(round(xy[0])), int(round(xy[1]))), radius, color, -1, cv2.LINE_AA
+    )
 
 
 def _draw_open(img, xy, color, radius=11):
-    cv2.circle(img, (int(round(xy[0])), int(round(xy[1]))), radius, color, 2, cv2.LINE_AA)
+    cv2.circle(
+        img, (int(round(xy[0])), int(round(xy[1]))), radius, color, 2, cv2.LINE_AA
+    )
 
 
 anchor_screen_xy = {
     "screen_bl": (0.0, float(SCREEN_H_PX)),
     "screen_br": (float(SCREEN_W_PX), float(SCREEN_H_PX)),
-    "box_bl":    box_bl_screen,
-    "box_br":    box_br_screen,
+    "box_bl": box_bl_screen,
+    "box_br": box_br_screen,
 }
 
 pf_lookup = per_frame_df.set_index("frame_idx")
@@ -808,16 +1152,38 @@ else:
         for _, lr in frame_labels.iterrows():
             if not lr.visible or lr.label_type not in LABEL_COLORS_BGR:
                 continue
-            _draw_filled(frame, (lr.x_frame, lr.y_frame), LABEL_COLORS_BGR[lr.label_type])
+            _draw_filled(
+                frame, (lr.x_frame, lr.y_frame), LABEL_COLORS_BGR[lr.label_type]
+            )
 
         # Draw back-projections if H is available.
         if status in ("detected", "interpolated", "extrapolated"):
             H_mat = _mat(pf_row)
             for lt, (sx, sy) in anchor_screen_xy.items():
                 bp_x, bp_y = _pt(H_mat, (sx, sy))
-                _draw_open(frame, (bp_x, bp_y), LABEL_COLORS_BGR.get(lt, (128, 128, 128)))
+                _draw_open(
+                    frame, (bp_x, bp_y), LABEL_COLORS_BGR.get(lt, (128, 128, 128))
+                )
 
-            res_row = residuals_df[residuals_df.frame_idx == fidx] if len(residuals_df) > 0 else pd.DataFrame()
+            # Draw the detected big_star (small filled dot) if present in fit.
+            if pd.notna(pf_row.get("big_star_x")):
+                _draw_filled(
+                    frame,
+                    (pf_row["big_star_x"], pf_row["big_star_y"]),
+                    LABEL_COLORS_BGR["big_star"],
+                    radius=5,
+                )
+                _draw_open(
+                    frame,
+                    (pf_row["big_star_x"], pf_row["big_star_y"]),
+                    LABEL_COLORS_BGR["big_star"],
+                )
+
+            res_row = (
+                residuals_df[residuals_df.frame_idx == fidx]
+                if len(residuals_df) > 0
+                else pd.DataFrame()
+            )
             if not res_row.empty:
                 r = res_row.iloc[0]
                 bp_x, bp_y = _pt(H_mat, (r.true_screen_x, r.true_screen_y))
@@ -825,13 +1191,30 @@ else:
 
         res_str = (
             f"{residuals_df[residuals_df.frame_idx==fidx].iloc[0].residual_px:.1f}px"
-            if len(residuals_df) > 0 and not residuals_df[residuals_df.frame_idx==fidx].empty
+            if len(residuals_df) > 0
+            and not residuals_df[residuals_df.frame_idx == fidx].empty
             else "n/a"
         )
-        caption = f"frame {fidx}  detection_status={status}  big_star_residual={res_str}"
+        n_anchors = (
+            int(pf_row.get("n_anchors_used", 0))
+            if pd.notna(pf_row.get("n_anchors_used"))
+            else 0
+        )
+        caption = (
+            f"frame {fidx}  detection_status={status}  n_anchors={n_anchors}  "
+            f"big_star_residual={res_str}"
+        )
         for thick, color in [(2, (255, 255, 255)), (1, (0, 0, 0))]:
-            cv2.putText(frame, caption, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, thick, cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                caption,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                color,
+                thick,
+                cv2.LINE_AA,
+            )
 
         overlay_path = out_dir / f"frame_{fidx}_overlay.jpg"
         cv2.imwrite(str(overlay_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
